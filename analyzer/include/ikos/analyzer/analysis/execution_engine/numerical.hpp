@@ -261,7 +261,14 @@ public:
       // When the size of the allocation is known (like it is here)
       // we mark the storage as uninitialized by assigning it
       // the undefined value.
+      //
+      // mem_write() internally calls nullity_assert_non_null(), which would
+      // narrow Nullity::top() (set by malloc/valloc/aligned_alloc) to
+      // Nullity::non_null(), destroying the NULL-return possibility.
+      // Restore the caller-specified nullity after the write so that
+      // NULL-check-less uses correctly trigger a nullity warning.
       this->_inv.normal().mem_write(ptr, ScalarLit::undefined(), alloc_size);
+      this->_inv.normal().nullity_set(ptr, nullity);
     }
 
     if (this->_opts.test(ExecutionEngine::UpdateAllocSizeVar)) {
@@ -2887,6 +2894,11 @@ private:
           !this->_inv.normal().nullity_is_null(ptr.var())) {
         // This should be the size of `ptr` instead of `size`
         this->_inv.normal().mem_copy(lhs.var(), ptr.var(), size);
+        // mem_copy calls nullity_assert_non_null on dest, narrowing lhs to
+        // non_null. Restore to top since realloc may return null.
+        if (!this->_inv.is_normal_flow_bottom()) {
+          this->_inv.normal().nullity_set(lhs.var(), Nullity::top());
+        }
       }
     }
 
