@@ -144,6 +144,34 @@ public:
   }
 
 private:
+  /// \brief Return true if the function belongs to the C++ standard library
+  ///
+  /// Checks for the mangled name prefixes used by libstdc++ and libc++:
+  ///   _ZNSt  - member of std:: (e.g. std::map, std::__1::__tree)
+  ///   _ZSt   - non-member of std:: (e.g. std::move)
+  static bool is_std_function(ar::Function* f) {
+    const std::string& name = f->name();
+    // Non-const member of std:: (_ZNSt...)
+    if (name.size() >= 5 &&
+        name[0] == '_' && name[1] == 'Z' &&
+        name[2] == 'N' && name[3] == 'S' && name[4] == 't') {
+      return true;
+    }
+    // Const member of std:: (_ZNKSt...) — K = const qualifier in Itanium ABI
+    if (name.size() >= 6 &&
+        name[0] == '_' && name[1] == 'Z' &&
+        name[2] == 'N' && name[3] == 'K' && name[4] == 'S' && name[5] == 't') {
+      return true;
+    }
+    // Non-member free function in std:: (_ZSt...)
+    if (name.size() >= 4 &&
+        name[0] == '_' && name[1] == 'Z' &&
+        name[2] == 'S' && name[3] == 't') {
+      return true;
+    }
+    return false;
+  }
+
   /// \brief Return a non-const reference on the current invariant
   AbstractDomain& inv() { return this->_engine.inv(); }
 
@@ -236,6 +264,9 @@ private:
     // By default, propagate the exception states
     AbstractDomain post = this->inv();
     post.set_normal_flow_to_bottom();
+
+    // True when the caller is user code (not from the standard library)
+    bool caller_is_std = is_std_function(this->_caller.function());
 
     // For each callee
     for (MemoryLocation* mem : callees) {
@@ -336,8 +367,20 @@ private:
       engine.inv().merge_propagated_in_caught_exceptions();
 
       if (engine.inv().is_normal_flow_bottom()) {
-        // Collect the exception states
-        post.join_with(std::move(engine.inv()));
+        if (!caller_is_std && is_std_function(callee)) {
+          // User code calls an STL function whose analysis produced normal=⊥
+          // (e.g., imprecision modeling std::__tree::__find_equal's while(true)
+          // loop). Apply the unknown-extern model as a sound over-approximation
+          // so normal flow continues in the caller.
+          NumericalExecutionEngineT fallback = this->_engine.fork();
+          fallback.inv().ignore_exceptions();
+          fallback.exec_unknown_extern_call(call);
+          fallback.inv().merge_propagated_in_caught_exceptions();
+          post.join_with(std::move(fallback.inv()));
+        } else {
+          // Collect the exception states
+          post.join_with(std::move(engine.inv()));
+        }
         continue;
       }
 
