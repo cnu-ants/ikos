@@ -1124,7 +1124,11 @@ public:
     }
 
     this->_uninitialized.assign_initialized(p);
-    this->_nullity.assign(p, q);
+    if (this->_integer.to_interval(o).is_zero()) {
+      this->_nullity.assign(p, q);
+    } else {
+      this->_nullity.set(p, this->_nullity.get(q));
+    }
     this->_points_to_map.set(p, this->_points_to_map.get(q));
     this->_integer.apply(IntBinaryOperator::Add,
                          ScalarVariableTrait::offset_var(p),
@@ -1150,7 +1154,11 @@ public:
     }
 
     this->_uninitialized.assign_initialized(p);
-    this->_nullity.assign(p, q);
+    if (o.is_zero()) {
+      this->_nullity.assign(p, q);
+    } else {
+      this->_nullity.set(p, this->_nullity.get(q));
+    }
     this->_points_to_map.set(p, this->_points_to_map.get(q));
     this->_integer.apply(IntBinaryOperator::Add,
                          ScalarVariableTrait::offset_var(p),
@@ -1180,7 +1188,11 @@ public:
     }
 
     this->_uninitialized.assign_initialized(p);
-    this->_nullity.assign(p, q);
+    if (this->_integer.to_interval(o).is_zero()) {
+      this->_nullity.assign(p, q);
+    } else {
+      this->_nullity.set(p, this->_nullity.get(q));
+    }
     this->_points_to_map.set(p, this->_points_to_map.get(q));
     VariableRef offset_p = ScalarVariableTrait::offset_var(p);
     VariableRef offset_q = ScalarVariableTrait::offset_var(q);
