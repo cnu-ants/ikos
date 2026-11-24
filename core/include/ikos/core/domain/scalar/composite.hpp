@@ -1348,7 +1348,14 @@ public:
       this->_points_to_map.refine(p, PointsToSetT::empty());
     } else {
       this->_points_to_map.refine(p, set.points_to());
-      this->_integer.refine(ScalarVariableTrait::offset_var(p), set.offsets());
+      // A pointer set only describes non-null pointers. A null pointer has
+      // offset 0, which may be outside of `set.offsets()` (e.g. a node whose
+      // other fields point into the same object). Refining the offset of a
+      // pointer that may be null would wrongly yield bottom.
+      if (this->_nullity.get(p).is_non_null()) {
+        this->_integer.refine(ScalarVariableTrait::offset_var(p),
+                              set.offsets());
+      }
     }
   }
 

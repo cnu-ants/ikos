@@ -61,7 +61,6 @@
 #include <ikos/analyzer/analysis/execution_engine/fixpoint_cache.hpp>
 #include <ikos/analyzer/analysis/execution_engine/numerical.hpp>
 #include <ikos/analyzer/analysis/pointer/value.hpp>
-#include <ikos/analyzer/util/demangle.hpp>
 
 namespace ikos {
 namespace analyzer {
