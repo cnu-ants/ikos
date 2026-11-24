@@ -1350,7 +1350,11 @@ private:
     }
 
     void floating_point_var(VariableRef lhs) {
-      this->_scalar.float_assign_nondet(lhs);
+      // Forget the previous value before copying the cell's initializedness.
+      // float_assign_nondet() would mark the result as initialized.
+      this->_scalar.float_forget(lhs);
+      this->_scalar.uninit_refine(
+          lhs, this->_scalar.uninit_to_uninitialized(this->_rhs));
     }
 
     void pointer_var(VariableRef lhs) {
