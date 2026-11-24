@@ -43,7 +43,11 @@
 
 #pragma once
 
+#include <map>
+#include <tuple>
+
 #include <ikos/core/adt/patricia_tree/map.hpp>
+#include <ikos/core/adt/patricia_tree/set.hpp>
 #include <ikos/core/domain/abstract_domain.hpp>
 #include <ikos/core/domain/machine_int/operator.hpp>
 #include <ikos/core/linear_expression.hpp>
@@ -55,7 +59,7 @@ namespace ikos {
 namespace core {
 namespace machine_int {
 
-/// \brief Generic implementation of non-relational domains for machine integers
+/// \brief Separate machine integer values augmented with copy equalities
 template < typename VariableRef, typename Value >
 class SeparateDomain final
     : public core::AbstractDomain< SeparateDomain< VariableRef, Value > > {
@@ -71,6 +75,10 @@ public:
 private:
   using VariableTrait = machine_int::VariableTraits< VariableRef >;
   using PatriciaTreeMapT = PatriciaTreeMap< VariableRef, Value >;
+  using CopySet = PatriciaTreeSet< VariableRef >;
+  using CopyMap = PatriciaTreeMap< VariableRef, CopySet >;
+  using ClassKey =
+      std::tuple< uint64_t, Signedness, boost::optional< ZNumber >, Index >;
 
 public:
   using LinearExpressionT = LinearExpression< MachineInt, VariableRef >;
@@ -79,6 +87,141 @@ public:
 private:
   PatriciaTreeMapT _tree;
   bool _is_bottom;
+
+  // Copies have equal values until a member is overwritten or forgotten.
+  // Singleton values already imply equality, so their classes are omitted.
+  CopyMap _copies;
+
+  ClassKey class_key(VariableRef x) const {
+    auto n = this->get(x).singleton();
+    if (n) {
+      return {VariableTrait::bit_width(x),
+              VariableTrait::sign(x),
+              n->to_z_number(),
+              0};
+    }
+    auto members = this->_copies.at(x);
+    return {VariableTrait::bit_width(x),
+            VariableTrait::sign(x),
+            boost::none,
+            IndexableTraits< VariableRef >::index(members ? *members->begin()
+                                                          : x)};
+  }
+
+  void forget_copy(VariableRef x) {
+    auto members = this->_copies.at(x);
+    if (!members) {
+      return;
+    }
+    CopySet remaining = *members;
+    remaining.erase(x);
+    this->_copies.erase(x);
+    for (VariableRef member : remaining) {
+      if (remaining.size() > 1) {
+        this->_copies.insert_or_assign(member, remaining);
+      } else {
+        this->_copies.erase(member);
+      }
+    }
+  }
+
+  // Change a value without invalidating its copy relation.
+  void set_value(VariableRef x, const Value& value) {
+    if (value.is_bottom()) {
+      this->set_to_bottom();
+    } else if (value.is_top()) {
+      this->_tree.erase(x);
+    } else {
+      this->_tree.insert_or_assign(x, value);
+    }
+  }
+
+  void merge_copies(CopySet members) {
+    CopySet all = members;
+    for (VariableRef member : members) {
+      if (auto group = this->_copies.at(member)) {
+        all.join_with(*group);
+      }
+    }
+    Value value = this->get(*all.begin());
+    for (VariableRef member : all) {
+      value.meet_with(this->get(member));
+    }
+    if (value.is_bottom()) {
+      this->set_to_bottom();
+      return;
+    }
+    for (VariableRef member : all) {
+      this->set_value(member, value);
+      this->_copies.erase(member);
+    }
+    if (!value.singleton() && all.size() > 1) {
+      for (VariableRef member : all) {
+        this->_copies.insert_or_assign(member, all);
+      }
+    }
+  }
+
+  void reduce_copies() {
+    CopyMap copies = this->_copies;
+    for (const auto& entry : copies) {
+      if (entry.first == *entry.second.begin()) {
+        this->merge_copies(entry.second);
+        if (this->is_bottom()) {
+          return;
+        }
+      }
+    }
+  }
+
+  // Keep equalities valid on both paths. Equal singleton values also imply
+  // equalities, even though no explicit copy class is stored for them.
+  void intersect_copies(const SeparateDomain& other) {
+    CopySet variables;
+    for (const auto& entry : this->_tree) {
+      variables.insert(entry.first);
+    }
+    for (const auto& entry : other._tree) {
+      variables.insert(entry.first);
+    }
+    for (const auto& entry : this->_copies) {
+      variables.insert(entry.first);
+    }
+    for (const auto& entry : other._copies) {
+      variables.insert(entry.first);
+    }
+    std::map< std::pair< ClassKey, ClassKey >, CopySet > groups;
+    for (VariableRef variable : variables) {
+      Value value = this->get(variable);
+      if (value.singleton() && value.equals(other.get(variable))) {
+        continue; // The merged value stays a singleton, so no class is needed.
+      }
+      groups[{this->class_key(variable), other.class_key(variable)}].insert(
+          variable);
+    }
+    CopyMap copies;
+    for (const auto& entry : groups) {
+      if (entry.second.size() > 1) {
+        for (VariableRef member : entry.second) {
+          copies.insert_or_assign(member, entry.second);
+        }
+      }
+    }
+    this->_copies = std::move(copies);
+  }
+
+  void meet_copies(const SeparateDomain& other) {
+    CopyMap copies = other._copies;
+    this->reduce_copies();
+    for (const auto& entry : copies) {
+      if (this->is_bottom()) {
+        return;
+      }
+      if (entry.first == *entry.second.begin()) {
+        this->merge_copies(entry.second);
+      }
+    }
+  }
 
 private:
   struct TopTag {};
@@ -130,17 +273,19 @@ public:
   bool is_bottom() const override { return this->_is_bottom; }
 
   bool is_top() const override {
-    return !this->is_bottom() && this->_tree.empty();
+    return !this->is_bottom() && this->_tree.empty() && this->_copies.empty();
   }
 
   void set_to_bottom() override {
     this->_is_bottom = true;
     this->_tree.clear();
+    this->_copies.clear();
   }
 
   void set_to_top() override {
     this->_is_bottom = false;
     this->_tree.clear();
+    this->_copies.clear();
   }
 
   bool leq(const SeparateDomain& other) const override {
@@ -149,9 +294,23 @@ public:
     } else if (other.is_bottom()) {
       return false;
     } else {
-      return this->_tree.leq(other._tree, [](const Value& x, const Value& y) {
-        return x.leq(y);
-      });
+      if (!this->_tree.leq(other._tree, [](const Value& x, const Value& y) {
+            return x.leq(y);
+          })) {
+        return false;
+      }
+      for (const auto& entry : other._copies) {
+        if (entry.first != *entry.second.begin()) {
+          continue;
+        }
+        ClassKey key = this->class_key(entry.first);
+        for (VariableRef member : entry.second) {
+          if (this->class_key(member) != key) {
+            return false;
+          }
+        }
+      }
+      return true;
     }
   }
 
@@ -164,7 +323,11 @@ public:
       return this->_tree.equals(other._tree,
                                 [](const Value& x, const Value& y) {
                                   return x.equals(y);
-                                });
+                                }) &&
+             this->_copies.equals(other._copies,
+                                  [](const CopySet& x, const CopySet& y) {
+                                    return x.equals(y);
+                                  });
     }
   }
 
@@ -174,6 +337,7 @@ public:
     } else if (this->is_bottom()) {
       this->operator=(other);
     } else {
+      this->intersect_copies(other);
       this->_tree.intersect_with(other._tree,
                                  [](const Value& x, const Value& y) {
                                    Value z = x.join(y);
@@ -183,6 +347,7 @@ public:
                                    }
                                    return boost::optional< Value >(z);
                                  });
+      this->reduce_copies();
     }
   }
 
@@ -192,6 +357,7 @@ public:
     } else if (this->is_bottom()) {
       this->operator=(other);
     } else {
+      this->intersect_copies(other);
       this->_tree.intersect_with(other._tree,
                                  [](const Value& x, const Value& y) {
                                    Value z = x.join_loop(y);
@@ -201,6 +367,7 @@ public:
                                    }
                                    return boost::optional< Value >(z);
                                  });
+      this->reduce_copies();
     }
   }
 
@@ -210,6 +377,7 @@ public:
     } else if (this->is_bottom()) {
       this->operator=(other);
     } else {
+      this->intersect_copies(other);
       this->_tree.intersect_with(other._tree,
                                  [](const Value& x, const Value& y) {
                                    Value z = x.join_loop(y);
@@ -219,6 +387,7 @@ public:
                                    }
                                    return boost::optional< Value >(z);
                                  });
+      this->reduce_copies();
     }
   }
 
@@ -228,6 +397,7 @@ public:
     } else if (this->is_bottom()) {
       this->operator=(other);
     } else {
+      this->intersect_copies(other);
       this->_tree.intersect_with(other._tree,
                                  [](const Value& x, const Value& y) {
                                    Value z = x.widening(y);
@@ -237,6 +407,7 @@ public:
                                    }
                                    return boost::optional< Value >(z);
                                  });
+      this->reduce_copies();
     }
   }
 
@@ -247,6 +418,7 @@ public:
     } else if (this->is_bottom()) {
       this->operator=(other);
     } else {
+      this->intersect_copies(other);
       this->_tree.intersect_with(other._tree,
                                  [threshold](const Value& x, const Value& y) {
                                    Value z = x.widening_threshold(y, threshold);
@@ -256,6 +428,7 @@ public:
                                    }
                                    return boost::optional< Value >(z);
                                  });
+      this->reduce_copies();
     }
   }
 
@@ -276,6 +449,9 @@ public:
       } catch (BottomFound&) {
         this->set_to_bottom();
       }
+      if (!this->is_bottom()) {
+        this->meet_copies(other);
+      }
     }
   }
 
@@ -295,6 +471,9 @@ public:
         });
       } catch (BottomFound&) {
         this->set_to_bottom();
+      }
+      if (!this->is_bottom()) {
+        this->meet_copies(other);
       }
     }
   }
@@ -318,6 +497,9 @@ public:
       } catch (BottomFound&) {
         this->set_to_bottom();
       }
+      if (!this->is_bottom()) {
+        this->meet_copies(other);
+      }
     }
   }
 
@@ -339,37 +521,29 @@ public:
   void set(VariableRef x, const Value& value) {
     if (this->is_bottom()) {
       return;
-    } else if (value.is_bottom()) {
-      this->set_to_bottom();
-    } else if (value.is_top()) {
-      this->_tree.erase(x);
-    } else {
-      this->_tree.insert_or_assign(x, value);
     }
+    this->forget_copy(x);
+    this->set_value(x, value);
   }
 
-  /// \brief Refine the abstract value of the given variable
-  void refine(VariableRef v, const Value& value) {
-    if (this->is_bottom()) {
+  /// \brief Refine all unchanged copies of the given variable
+  void refine(VariableRef x, const Value& value) {
+    if (this->is_bottom() || value.is_top()) {
       return;
-    } else if (value.is_bottom()) {
+    }
+    Value refined = this->get(x).meet(value);
+    CopySet members{x};
+    if (auto group = this->_copies.at(x)) {
+      members = *group;
+    }
+    if (refined.is_bottom()) {
       this->set_to_bottom();
-    } else if (value.is_top()) {
       return;
-    } else {
-      try {
-        this->_tree.update_or_insert(
-            [](const Value& x, const Value& y) {
-              Value z = x.meet(y);
-              if (z.is_bottom()) {
-                throw BottomFound();
-              }
-              return boost::optional< Value >(z);
-            },
-            v,
-            value);
-      } catch (BottomFound&) {
-        this->set_to_bottom();
+    }
+    for (VariableRef member : members) {
+      this->set_value(member, refined);
+      if (refined.singleton()) {
+        this->_copies.erase(member);
       }
     }
   }
@@ -405,14 +579,24 @@ public:
     if (this->is_bottom()) {
       return;
     }
+    this->forget_copy(x);
     this->_tree.erase(x);
   }
 
   /// \brief Assign `x = n`
   void assign(VariableRef x, const MachineInt& n) { this->set(x, Value(n)); }
 
-  /// \brief Assign `x = n`
-  void assign(VariableRef x, VariableRef y) { this->set(x, this->get(y)); }
+  /// \brief Assign `x = y`
+  void assign(VariableRef x, VariableRef y) {
+    if (this->is_bottom() || x == y) {
+      return;
+    }
+    this->set(x, this->get(y));
+    if (VariableTrait::bit_width(x) == VariableTrait::bit_width(y) &&
+        VariableTrait::sign(x) == VariableTrait::sign(y)) {
+      this->merge_copies(CopySet{x, y});
+    }
+  }
 
   /// \brief Assign `x = e`
   ///
@@ -457,6 +641,20 @@ public:
       o << "⊥";
     } else {
       this->_tree.dump(o);
+      if (!this->_copies.empty()) {
+        o << " copies={";
+        bool first = true;
+        for (const auto& entry : this->_copies) {
+          if (entry.first == *entry.second.begin()) {
+            if (!first) {
+              o << "; ";
+            }
+            first = false;
+            entry.second.dump(o);
+          }
+        }
+        o << "}";
+      }
     }
   }
 

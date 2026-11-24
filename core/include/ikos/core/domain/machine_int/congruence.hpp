@@ -197,8 +197,8 @@ public:
     switch (pred) {
       case Predicate::EQ: {
         Congruence c = xc.meet(yc);
-        this->_inv.set(x, c);
-        this->_inv.set(y, c);
+        this->_inv.refine(x, c);
+        this->_inv.refine(y, c);
       } break;
       case Predicate::NE: {
         if (x == y) {
@@ -234,7 +234,7 @@ public:
 
     switch (pred) {
       case Predicate::EQ: {
-        this->_inv.set(x, xc.meet(yc));
+        this->_inv.refine(x, xc.meet(yc));
       } break;
       case Predicate::NE: {
         // nothing
@@ -288,7 +288,7 @@ public:
       this->set_to_bottom();
     } else {
       IntervalCongruence iv(value, this->_inv.get(x));
-      this->_inv.set(x, iv.congruence());
+      this->_inv.refine(x, iv.congruence());
     }
   }
 
@@ -303,7 +303,7 @@ public:
       this->set_to_bottom();
     } else {
       IntervalCongruence iv = IntervalCongruence(this->_inv.get(x)).meet(value);
-      this->_inv.set(x, iv.congruence());
+      this->_inv.refine(x, iv.congruence());
     }
   }
 

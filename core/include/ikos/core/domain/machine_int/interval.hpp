@@ -214,8 +214,8 @@ public:
     switch (pred) {
       case Predicate::EQ: {
         Interval i = xi.meet(yi);
-        this->_inv.set(x, i);
-        this->_inv.set(y, i);
+        this->_inv.refine(x, i);
+        this->_inv.refine(y, i);
       } break;
       case Predicate::NE: {
         if (x == y) {
@@ -223,10 +223,10 @@ public:
           return;
         }
         if (xi.singleton()) {
-          this->_inv.set(y, trim_bound(yi, *xi.singleton()));
+          this->_inv.refine(y, trim_bound(yi, *xi.singleton()));
         }
         if (yi.singleton()) {
-          this->_inv.set(x, trim_bound(xi, *yi.singleton()));
+          this->_inv.refine(x, trim_bound(xi, *yi.singleton()));
         }
       } break;
       case Predicate::GT: {
@@ -268,10 +268,10 @@ public:
     switch (pred) {
       case Predicate::EQ: {
         Interval i = xi.meet(yi);
-        this->_inv.set(x, i);
+        this->_inv.refine(x, i);
       } break;
       case Predicate::NE: {
-        this->_inv.set(x, trim_bound(xi, y));
+        this->_inv.refine(x, trim_bound(xi, y));
       } break;
       case Predicate::GT: {
         if (y.is_max()) {
@@ -338,7 +338,7 @@ public:
       this->set_to_bottom();
     } else {
       IntervalCongruence iv(this->_inv.get(x), value);
-      this->_inv.set(x, iv.interval());
+      this->_inv.refine(x, iv.interval());
     }
   }
 
@@ -349,7 +349,7 @@ public:
       this->set_to_bottom();
     } else {
       IntervalCongruence iv = IntervalCongruence(this->_inv.get(x)).meet(value);
-      this->_inv.set(x, iv.interval());
+      this->_inv.refine(x, iv.interval());
     }
   }
 
