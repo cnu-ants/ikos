@@ -449,6 +449,12 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Keep the first/final states of proven one-iteration loops separate.
+  // This normalization preserves body instructions and applies to none too.
+  if (OptLevel == None || OptLevel == Basic) {
+    pass_manager.add(ikos_pp::create_simplify_single_iteration_loops_pass());
+  }
+
   // Prove supported floating comparisons and expose necessary integer ranges
   // for math guards. Keep calls and potentially erroneous arithmetic, so
   // analysis diagnostics and side effects are not optimized away.
