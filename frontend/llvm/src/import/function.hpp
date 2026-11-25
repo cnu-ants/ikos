@@ -334,6 +334,12 @@ private:
                                       llvm::BinaryOperator* inst,
                                       ar::InternalVariable* var);
 
+  /// \brief Translate `(signed narrow)(sext a op sext b)` as a narrow signed
+  /// operation (v3.5.10.2)
+  bool translate_narrow_signed_trunc(BasicBlockTranslation* bb_translation,
+                                     llvm::CastInst* cast,
+                                     ar::InternalVariable* var);
+
   /// \brief Translate a llvm::CmpInst
   void translate_cmp(BasicBlockTranslation* bb_translation, llvm::CmpInst* cmp);
 
