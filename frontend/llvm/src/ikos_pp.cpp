@@ -256,8 +256,8 @@ int main(int argc, char** argv) {
     // Ensure one single exit point per function (opt -mergereturn)
     pass_manager.add(llvm::createUnifyFunctionExitNodesPass());
   } else if (OptLevel == Basic) {
-    // SSA (opt -mem2reg)
-    pass_manager.add(llvm::createPromoteMemoryToRegisterPass());
+    // SSA, preserving loads that may read uninitialized stack memory
+    pass_manager.add(ikos_pp::create_promote_initialized_pass());
 
     // Global dead code elimination (opt -globaldce)
     // note: unfortunately, it removes some debug info about global variables
