@@ -50,6 +50,9 @@ namespace ikos {
 namespace frontend {
 namespace pass {
 
+/// \brief Prove constant floating comparisons and strengthen math guards
+llvm::FunctionPass* create_prove_constant_float_comparison_pass();
+
 /// \brief Lower constant expressions into instructions
 llvm::FunctionPass* create_lower_cst_expr_pass();
 
@@ -78,6 +81,9 @@ void initialize_ikos_passes(llvm::PassRegistry&);
 } // end namespace ikos
 
 namespace llvm {
+
+/// \brief Initialize the ProveConstantFloatComparisonPass
+void initializeProveConstantFloatComparisonPassPass(llvm::PassRegistry&);
 
 /// \brief Initialize the LowerCstExprPass
 void initializeLowerCstExprPassPass(llvm::PassRegistry&);

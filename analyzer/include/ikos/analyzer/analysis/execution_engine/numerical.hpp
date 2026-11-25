@@ -2077,11 +2077,7 @@ public:
         this->exec_free(call);
       } break;
       case ar::Intrinsic::LibcAbs: {
-        this->exec_unknown_call(call,
-                                /* may_write_params = */ false,
-                                /* ignore_unknown_write = */ false,
-                                /* may_write_globals = */ false,
-                                /* may_throw_exc = */ false);
+        this->exec_abs(call);
       } break;
       case ar::Intrinsic::LibcRand:
       case ar::Intrinsic::LibcSrand: {
@@ -2462,6 +2458,45 @@ private:
   /// @}
   /// \name Execution of intrinsic functions
   /// @{
+
+  /// \brief Model a representable signed integer absolute value.
+  void exec_abs(ar::CallBase* call) {
+    if (!call->has_result()) {
+      return;
+    }
+    const ScalarLit& arg = this->_lit_factory.get_scalar(call->argument(0));
+    const ScalarLit& result = this->_lit_factory.get_scalar(call->result());
+    IntInterval input = arg.is_machine_int()
+                            ? IntInterval(arg.machine_int())
+                            : this->_inv.normal().int_to_interval(arg.var());
+    this->_inv.normal().int_assign_nondet(result.var());
+    if (input.is_bottom()) {
+      this->_inv.set_normal_flow_to_bottom();
+      return;
+    }
+    if (input.lb().is_min()) {
+      // abs(MIN) is not representable. Keep the unknown result when that input
+      // is possible; do not silently assume that the call was valid.
+      return;
+    }
+    auto zero = MachineInt::zero(input.bit_width(), Signed);
+    if (arg.is_machine_int()) {
+      this->_inv.normal().int_assign(result.var(),
+                                     core::abs(arg.machine_int()));
+    } else if (input.lb() >= zero) {
+      this->_inv.normal().int_assign(result.var(), arg.var());
+    } else if (input.ub() < zero) {
+      this->_inv.normal().int_apply(IntBinaryOperator::SubNoWrap,
+                                    result.var(),
+                                    zero,
+                                    arg.var());
+    } else {
+      this->_inv.normal().int_set(result.var(),
+                                  IntInterval(zero,
+                                              core::max(-input.lb(),
+                                                        input.ub())));
+    }
+  }
 
   /// \brief Execute a call to memcpy(dest, src, len) or memmove(dest, src, len)
   void exec_memcpy_or_memmove(ar::CallBase* call) {

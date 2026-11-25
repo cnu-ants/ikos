@@ -243,8 +243,11 @@ FunctionType* Intrinsic::type(Bundle* bundle, ID id, Type* template_ty) {
       params.push_back(void_ptr_ty); // ptr
     } break;
     case LibcAbs: {
-      ret_ty = si32_ty;          // ret
-      params.push_back(si32_ty); // i
+      ikos_assert(!template_ty ||
+                  (template_ty->is_integer() &&
+                   cast< IntegerType >(template_ty)->is_signed()));
+      ret_ty = template_ty ? template_ty : si32_ty;
+      params.push_back(ret_ty);
     } break;
     case LibcRand: {
       ret_ty = si32_ty; // ret
@@ -674,7 +677,8 @@ std::string Intrinsic::short_name(ID id, Type* template_ty) {
     case LibcFree:
       return "libc.free";
     case LibcAbs:
-      return "libc.abs";
+      return template_ty ? "libc.abs." + template_type_name(template_ty)
+                         : "libc.abs";
     case LibcRand:
       return "libc.rand";
     case LibcSrand:

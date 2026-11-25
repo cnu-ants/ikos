@@ -117,6 +117,17 @@ ar::Function* LibraryFunctionImporter::function(llvm::StringRef name,
       return this->_bundle->intrinsic_function(ar::Intrinsic::LibcFree);
     } else if (name == "abs") {
       return this->_bundle->intrinsic_function(ar::Intrinsic::LibcAbs);
+    } else if (name == "labs" || name == "llabs" || name == "imaxabs") {
+      auto integer = llvm::dyn_cast< llvm::IntegerType >(type->getReturnType());
+      if (!integer || type->isVarArg() || type->getNumParams() != 1 ||
+          type->getParamType(0) != integer) {
+        return nullptr;
+      }
+      auto signed_type = ar::IntegerType::get(this->_context,
+                                              integer->getBitWidth(),
+                                              ar::Signed);
+      return this->_bundle->intrinsic_function(ar::Intrinsic::LibcAbs,
+                                               signed_type);
     } else if (name == "rand") {
       return this->_bundle->intrinsic_function(ar::Intrinsic::LibcRand);
     } else if (name == "srand") {
