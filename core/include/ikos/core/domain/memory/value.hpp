@@ -1149,7 +1149,7 @@ private:
             new_cells.add(high_cell);
           }
         }
-        this->_scalar.dynamic_forget(cell);
+        this->forget_cell(cell);
         new_cells.remove(cell);
       }
     }
@@ -1190,7 +1190,7 @@ private:
           // This cell has only one way to be affected by the write statement
           updated_cells.push_back(cell);
         } else {
-          this->_scalar.dynamic_forget(cell);
+          this->forget_cell(cell);
           new_cells.remove(cell);
         }
       }
@@ -1358,6 +1358,27 @@ private:
     return new_cell;
   }
 
+  /// Forget an encoded cell together with its memory pointer summary.
+  void forget_cell(VariableRef cell) {
+    if (this->_scalar.scalar_pointer_origin(cell)) {
+      this->_pointer_sets.forget(CellVariableTrait::base(cell));
+    }
+    this->_scalar.dynamic_forget(cell);
+  }
+
+  void invalidate_encoded_pointer(VariableRef cell, const LiteralT& rhs) {
+    if (rhs.is_pointer_var() || rhs.is_memory_location() || rhs.is_null() ||
+        rhs.is_undefined() ||
+        (rhs.is_machine_int() && rhs.machine_int().is_zero()) ||
+        (rhs.is_machine_int_var() &&
+         this->_scalar.scalar_pointer_origin(rhs.var()))) {
+      return;
+    }
+    if (this->_scalar.scalar_pointer_origin(cell)) {
+      this->_pointer_sets.forget(CellVariableTrait::base(cell));
+    }
+  }
+
   /// \brief Assignment `var = literal`
   class LiteralWriter : public LiteralT::template Visitor<> {
   private:
@@ -1488,12 +1509,14 @@ private:
 
   /// \brief Perform a strong update `lhs = rhs`
   void strong_update(VariableRef lhs, const LiteralT& rhs) {
+    this->invalidate_encoded_pointer(lhs, rhs);
     LiteralWriter v(lhs, this->_scalar);
     rhs.apply_visitor(v);
   }
 
   /// \brief Perform a weak update `lhs = rhs`
   void weak_update(VariableRef lhs, const LiteralT& rhs) {
+    this->invalidate_encoded_pointer(lhs, rhs);
     ScalarDomain scalar = this->_scalar;
     LiteralWriter v(lhs, scalar);
     rhs.apply_visitor(v);
@@ -1626,6 +1649,14 @@ public:
                                                         Unsigned)));
     } else if (rhs.is_pointer_var()) {
       rhs_ptr = this->_scalar.pointer_to_pointer(rhs.var());
+    } else if (rhs.is_machine_int_var()) {
+      auto origin = this->_scalar.scalar_pointer_origin(rhs.var());
+      if (!origin) {
+        return;
+      }
+      // ABI-coerced pointer bits can later be copied/read as a pointer.
+      // Keep the memory pointer summary consistent with the scalar cells.
+      rhs_ptr = *origin;
     } else {
       // Right hand side is not a pointer, nothing else to do
       return;
@@ -1984,7 +2015,7 @@ public:
                 this->weak_update(cell, zero_lit);
               }
             } else if (!range.meet(unsafe_range).is_bottom()) {
-              this->_scalar.dynamic_forget(cell);
+              this->forget_cell(cell);
               new_cells.remove(cell);
             }
           }
@@ -2045,7 +2076,7 @@ private:
       }
 
       for (VariableRef cell : cells) {
-        this->_scalar.dynamic_forget(cell);
+        this->forget_cell(cell);
       }
     }
 
@@ -2061,7 +2092,7 @@ private:
     }
 
     for (VariableRef cell : cells) {
-      this->_scalar.dynamic_forget(cell);
+      this->forget_cell(cell);
     }
 
     this->_cells.forget(addr);
@@ -2120,7 +2151,7 @@ private:
             preserve_zero(range.ub() + one, old.ub() - range.ub());
           }
         }
-        this->_scalar.dynamic_forget(cell);
+        this->forget_cell(cell);
         new_cells.remove(cell);
       }
     }

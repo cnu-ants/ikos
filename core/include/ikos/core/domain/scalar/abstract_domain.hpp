@@ -43,6 +43,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include <ikos/core/domain/abstract_domain.hpp>
 #include <ikos/core/domain/machine_int/operator.hpp>
 #include <ikos/core/domain/pointer/operator.hpp>
@@ -475,6 +477,13 @@ public:
 
   /// \brief Assign `x` to a non deterministic value
   virtual void scalar_assign_nondet(VariableRef x) = 0;
+
+  /// Return a snapshot for an intact pointer encoding in an integer or cell.
+  /// Domains without this optional precision return no origin.
+  virtual boost::optional< PointerAbsValueT > scalar_pointer_origin(
+      VariableRef /*x*/) const {
+    return boost::none;
+  }
 
   /// \brief Assign `x = ptr-to-int p`
   virtual void scalar_pointer_to_int(VariableRef x,
