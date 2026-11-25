@@ -1683,10 +1683,13 @@ public:
       if (!s->is_volatile()) {
         // Perform memory read in the value domain
         this->_inv.normal().mem_read(lhs, ptr.var(), size);
-        // Recover definite initialization lost when distinct heap objects
-        // merge. Only strengthen the result after an all-path store proof.
+        // Recover initialization lost by heap joins or array-loop widening.
+        // Only strengthen after a complete-store or counted-loop proof.
         if (!this->_inv.normal().uninit_is_initialized(lhs.var())) {
-          if (prove_initialized_load(s, this->_call_context)) {
+          if (prove_initialized_load(s, this->_call_context) ||
+              prove_loop_initialized_load(
+                  s, this->_inv.normal().pointer_offset_to_interval_congruence(
+                         ptr.var()))) {
             this->_inv.normal().uninit_refine(lhs.var(),
                                              Uninitialized::initialized());
           } else if (prove_uninitialized_load(s, this->_call_context)) {
