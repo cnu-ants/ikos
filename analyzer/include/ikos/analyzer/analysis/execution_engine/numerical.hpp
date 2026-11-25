@@ -1058,9 +1058,9 @@ private:
     this->_inv.normal().float_assign_nondet(lhs.var());
 
     // Propagate the zero classification (v3.5.11.1).
-    // - Widening (fpext) is exact: zero stays zero, and every nonzero value,
-    //   including a subnormal of the narrower format, is a nonzero normal
-    //   value of the wider format.
+    // - Widening (fpext) is exact: zero stays zero, and every nonzero value
+    //   stays nonzero (a subnormal input keeps the subnormal class, see
+    //   below).
     // - Narrowing (fptrunc) only preserves zero: a tiny nonzero value can
     //   round to zero or become subnormal.
     uint64_t format = float_format(lhs.var()->type());
@@ -1069,12 +1069,17 @@ private:
     }
     if (source.is_zero()) {
       this->_inv.normal().float_set_zero(lhs.var(), core::FloatZero::zero(format));
-    } else if (widen && source.is_non_zero()) {
-      this->_inv.normal().float_set_zero(lhs.var(),
-                                         core::FloatZero::other(format));
     } else if (widen) {
-      auto value = core::FloatZero::zero(format);
-      value.join_with(core::FloatZero::other(format));
+      // v3.5.19: under a non-IEEE denormal mode (e.g. preserve-sign), a
+      // subnormal input may be flushed to zero by the extension. Keep the
+      // subnormal class so that only an IEEE function treats it as nonzero.
+      auto value = core::FloatZero::other(format);
+      if (source.may_be_subnormal()) {
+        value.join_with(core::FloatZero::subnormal(format));
+      }
+      if (!source.is_non_zero()) {
+        value.join_with(core::FloatZero::zero(format));
+      }
       this->_inv.normal().float_set_zero(lhs.var(), value);
     }
   }
@@ -1856,7 +1861,11 @@ public:
         this->_inv.normal().mem_read(lhs, ptr.var(), size);
         // Recover initialization lost by heap joins or array-loop widening.
         // Only strengthen after a complete-store or counted-loop proof.
-        if (!this->_inv.normal().uninit_is_initialized(lhs.var())) {
+        // v3.5.19: only an unknown state is strengthened. A proof that
+        // contradicts a definite state (e.g. a wrong `pure` attribute) must
+        // not turn the state into bottom and drop the rest of the path.
+        if (!this->_inv.normal().uninit_is_initialized(lhs.var()) &&
+            !this->_inv.normal().uninit_is_uninitialized(lhs.var())) {
           if (prove_initialized_load(s, this->_call_context) ||
               prove_loop_initialized_load(
                   s, this->_inv.normal().pointer_offset_to_interval_congruence(
@@ -2233,7 +2242,23 @@ public:
       // so that a later reload of the same address keeps `!= 0`.
       if (!load->is_volatile() && load_still_valid(load, at)) {
         const ScalarLit& ptr = this->_lit_factory.get_scalar(load->operand());
+        // v3.5.19: only write back into stack or global objects. A dynamic
+        // allocation site may stand for several objects (e.g. malloc in a
+        // loop); a strong write there would assert `!= 0` on all of them.
+        bool single_objects = false;
         if (ptr.is_pointer_var()) {
+          auto addrs = this->_inv.normal().pointer_to_points_to(ptr.var());
+          single_objects = !addrs.is_top() && !addrs.is_bottom() &&
+                           !addrs.is_empty();
+          if (single_objects) {
+            for (MemoryLocation* addr : addrs) {
+              single_objects = single_objects &&
+                               (isa< LocalMemoryLocation >(addr) ||
+                                isa< GlobalMemoryLocation >(addr));
+            }
+          }
+        }
+        if (single_objects) {
           auto size = MachineInt(
               this->_data_layout.store_size_in_bytes(load->result()->type()),
               this->_data_layout.pointers.bit_width,
@@ -3377,12 +3402,27 @@ private:
 
       if (ptr.is_pointer_var() &&
           !this->_inv.normal().nullity_is_null(ptr.var())) {
+        // v3.5.19: realloc(NULL, n) copies nothing. mem_copy asserts that the
+        // source is non-null, which would drop the null path of `ptr` (and,
+        // through nullity copies, of the variable it was loaded from). Keep
+        // that path separately and join it after the copy.
+        boost::optional< AbstractDomain > null_path;
+        if (!this->_inv.normal().nullity_is_non_null(ptr.var())) {
+          AbstractDomain tmp = this->_inv;
+          tmp.normal().nullity_assert_null(ptr.var());
+          if (!tmp.is_normal_flow_bottom()) {
+            null_path = std::move(tmp);
+          }
+        }
         // This should be the size of `ptr` instead of `size`
         this->_inv.normal().mem_copy(lhs.var(), ptr.var(), size);
         // mem_copy calls nullity_assert_non_null on dest, narrowing lhs to
         // non_null. Restore to top since realloc may return null.
         if (!this->_inv.is_normal_flow_bottom()) {
           this->_inv.normal().nullity_set(lhs.var(), Nullity::top());
+        }
+        if (null_path) {
+          this->_inv.join_with(*null_path);
         }
       }
     }
@@ -3664,9 +3704,13 @@ private:
     if (std::string("diouxXn").find(conversion) != std::string::npos &&
         element->is_integer()) {
       auto bits = cast< ar::IntegerType >(element)->bit_width();
+      // v3.5.19: the modelled write must cover the real one. `long` is 64
+      // bits on LP64 and 32 bits on ILP32; a 32-bit destination with "%ld"
+      // on a 64-bit target (undefined, but writes 8 bytes) uses the fallback.
+      auto pointer_bits = this->_data_layout.pointers.bit_width;
       scalar = (length.empty() && bits == 32) ||
                (length == "hh" && bits == 8) || (length == "h" && bits == 16) ||
-               (length == "l" && (bits == 32 || bits == 64)) ||
+               (length == "l" && (bits == 64 || (bits == 32 && pointer_bits == 32))) ||
                ((length == "ll" || length == "j") && bits == 64) ||
                ((length == "z" || length == "t") &&
                 bits == this->_data_layout.pointers.bit_width);
@@ -3675,7 +3719,10 @@ private:
       auto semantic = cast< ar::FloatType >(element)->float_semantic();
       scalar = (length.empty() && semantic == ar::Float) ||
                (length == "l" && semantic == ar::Double) ||
-               (length == "L" && semantic != ar::Half && semantic != ar::Float);
+               // v3.5.19: long double is 16 bytes on x86_64: a double
+               // destination with "%Lf" could be overwritten past its end.
+               (length == "L" && semantic != ar::Half && semantic != ar::Float &&
+                semantic != ar::Double);
     } else if (conversion == 'p') {
       scalar = element->is_pointer();
     }
@@ -3687,8 +3734,9 @@ private:
         return boost::none;
       }
       auto bits = cast< ar::IntegerType >(element)->bit_width();
-      if (!((length.empty() && bits == 8) ||
-            (length == "l" && (bits == 16 || bits == 32)))) {
+      // v3.5.19: wchar_t is up to 32 bits; a 16-bit destination could be
+      // written with 32-bit wide characters.
+      if (!((length.empty() && bits == 8) || (length == "l" && bits == 32))) {
         return boost::none;
       }
       bytes = this->_data_layout.alloc_size_in_bytes(element);
@@ -4021,9 +4069,22 @@ private:
         ++pos;
         output.push_back('%');
       } else {
-        bool left = pos < format->size() && (*format)[pos] == '-';
-        if (left) {
-          ++pos;
+        // v3.5.19: only the '-' flag is modelled. Other flags ('0', '+',
+        // ' ', '#', '\'') change the output (e.g. "%05s" is undefined and
+        // pads with '0' on some libc): use the generic model instead. A '0'
+        // here would otherwise be read as part of the width.
+        bool left = false;
+        while (pos < format->size()) {
+          char flag = (*format)[pos];
+          if (flag == '-') {
+            left = true;
+            ++pos;
+          } else if (flag == '0' || flag == '+' || flag == ' ' ||
+                     flag == '#' || flag == '\'') {
+            return boost::none;
+          } else {
+            break;
+          }
         }
         unsigned width = 0;
         if (pos < format->size() && (*format)[pos] == '*') {

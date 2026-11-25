@@ -1475,6 +1475,7 @@ private:
       } else if (MachIntVariableTrait::bit_width(lhs) ==
                  MachIntVariableTrait::bit_width(this->_rhs)) {
         this->_scalar.dynamic_read_int(lhs, this->_rhs);
+        this->detach_from_summary(lhs);
       } else {
         this->_scalar.int_assign_nondet(lhs);
       }
@@ -1502,6 +1503,17 @@ private:
         this->_scalar.pointer_assign_null(lhs);
       } else {
         this->_scalar.dynamic_read_pointer(lhs, this->_rhs);
+        this->detach_from_summary(lhs);
+      }
+    }
+
+    /// \brief v3.5.19: a cell of a location that may stand for several
+    /// objects is not equal to the value read from one of them. Do not keep
+    /// a copy relation, or refining the read value would refine every object.
+    void detach_from_summary(VariableRef lhs) {
+      if (MemoryLocationSummaryTraits< MemoryLocationRef >::may_be_summary(
+              CellVariableTrait::base(this->_rhs))) {
+        this->_scalar.forget_copy_relations(lhs);
       }
     }
 

@@ -575,6 +575,9 @@ public:
   }
 
   /// \brief Forget the abstract value of the given variable
+  /// \brief Remove x from its copy class, keeping its value (v3.5.19)
+  void forget_copies(VariableRef x) { this->forget_copy(x); }
+
   void forget(VariableRef x) {
     if (this->is_bottom()) {
       return;

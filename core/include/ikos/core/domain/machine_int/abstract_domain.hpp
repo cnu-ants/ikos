@@ -179,6 +179,13 @@ public:
   /// \brief Forget a variable
   virtual void forget(VariableRef x) = 0;
 
+  /// \brief Remove x from any copy (equality) relation, keeping its value
+  ///
+  /// v3.5.19: used after reading a memory cell that may stand for several
+  /// objects, so that a later refinement of x does not refine the cell.
+  /// Domains without copy relations do nothing.
+  virtual void forget_copies(VariableRef /*x*/) {}
+
   /// \brief Projection to an interval
   ///
   /// Return an overapproximation of the value of `x` as an interval

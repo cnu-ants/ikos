@@ -312,6 +312,10 @@ public:
   /// \brief Forget a floating point variable
   virtual void float_forget(VariableRef x) = 0;
 
+  /// \brief Remove an integer or pointer variable from the copy relations
+  /// of the integer and nullity domains, keeping its value (v3.5.19)
+  virtual void forget_copy_relations(VariableRef /*x*/) {}
+
   /// @}
   /// \name Nullity abstract domain methods
   /// @{

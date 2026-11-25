@@ -394,6 +394,14 @@ struct IndexableTraits< analyzer::MemoryLocation* > {
   }
 };
 
+/// \brief A dynamic allocation site may stand for several objects (v3.5.19)
+template <>
+struct MemoryLocationSummaryTraits< analyzer::MemoryLocation* > {
+  static bool may_be_summary(analyzer::MemoryLocation* m) {
+    return m->kind() == analyzer::MemoryLocation::DynAllocMemoryKind;
+  }
+};
+
 /// \brief Implement DumpableTraits for MemoryLocation*
 template <>
 struct DumpableTraits< analyzer::MemoryLocation* > {

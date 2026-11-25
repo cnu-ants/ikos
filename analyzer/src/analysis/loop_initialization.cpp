@@ -29,7 +29,10 @@ namespace {
 /// through the returned pointer.
 bool heap_allocation_size(const llvm::CallBase* call, uint64_t& size) {
   const llvm::Function* callee = call->getCalledFunction();
-  if (!callee || call->arg_size() < 1) {
+  // v3.5.19: trust the allocator contract (a fresh block that does not
+  // overlap live memory) only for the library declaration, not for a
+  // function of the same name defined in the program.
+  if (!callee || !callee->isDeclaration() || call->arg_size() < 1) {
     return false;
   }
   llvm::StringRef name = callee->getName();

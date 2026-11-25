@@ -82,5 +82,12 @@ struct IsMemoryLocation
                    IsDumpable< MemoryLocationRef >,
                    IsIndexable< MemoryLocationRef > > {};
 
+/// \brief Whether a memory location may stand for several concrete objects
+/// at the same time (e.g. a dynamic allocation site in a loop). v3.5.19.
+template < typename MemoryLocationRef >
+struct MemoryLocationSummaryTraits {
+  static bool may_be_summary(MemoryLocationRef) { return false; }
+};
+
 } // end namespace core
 } // end namespace ikos

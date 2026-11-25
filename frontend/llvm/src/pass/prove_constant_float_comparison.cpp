@@ -555,7 +555,9 @@ public:
       if (auto trunc = dyn_cast< TruncInst >(inner)) {
         inner = this->resolve(trunc->getOperand(0));
         auto sext = dyn_cast< SExtInst >(inner);
-        if (!sext || sext->getSrcTy()->getIntegerBitWidth() >
+        // v3.5.19: the source must be strictly narrower than the truncated
+        // value. With equal widths, trunc(sext c) is c itself and can be MIN.
+        if (!sext || sext->getSrcTy()->getIntegerBitWidth() >=
                          trunc->getDestTy()->getIntegerBitWidth()) {
           break;
         }

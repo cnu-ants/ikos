@@ -309,6 +309,8 @@ public:
 
   void forget(VariableRef x) override { this->_inv.forget(x); }
 
+  void forget_copies(VariableRef x) override { this->_inv.forget_copies(x); }
+
   Interval to_interval(VariableRef x) const override {
     return this->to_interval_congruence(x).interval();
   }
