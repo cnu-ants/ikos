@@ -79,6 +79,20 @@ bool cxx_integer_abs(const Function* callee) {
           callee->hasAvailableExternallyLinkage());
 }
 
+/// \brief Whether the call may refer to the standard library function
+/// `name` (v3.5.20). With -fno-builtin / -ffreestanding the caller has the
+/// "no-builtins" (or "no-builtin-<name>") attribute and the call may be to any
+/// function of that name: do not give it the standard meaning.
+bool builtin_semantics(const CallBase* call, StringRef name) {
+  if (call->isNoBuiltin()) {
+    return false;
+  }
+  const Function* caller = call->getFunction();
+  return caller == nullptr ||
+         (!caller->hasFnAttribute("no-builtins") &&
+          !caller->hasFnAttribute(("no-builtin-" + name).str()));
+}
+
 /// Restricted constant proofs and necessary integer ranges for math guards.
 /// Unsupported operations, unresolved aliases and special floating values are
 /// left to the original analysis. No host floating arithmetic is used.
@@ -141,6 +155,7 @@ private:
     StringRef name = callee->getName();
     if (!(intrinsic || cxx || name == "abs" || name == "labs" ||
           name == "llabs" || name == "imaxabs") ||
+        (!intrinsic && !builtin_semantics(call, name)) ||
         call->arg_size() != (intrinsic ? 2 : 1) ||
         call->getArgOperand(0)->getType() != call->getType()) {
       return nullptr;
@@ -307,9 +322,10 @@ private:
     if (callee && callee->isDeclaration() && !callee->isVarArg()) {
       auto name = callee->getName();
       auto type = call->getType();
-      library = (name == "sqrt" && type->isDoubleTy()) ||
-                (name == "sqrtf" && type->isFloatTy()) ||
-                (name == "sqrtl" && type->isFloatingPointTy());
+      library = ((name == "sqrt" && type->isDoubleTy()) ||
+                 (name == "sqrtf" && type->isFloatTy()) ||
+                 (name == "sqrtl" && type->isFloatingPointTy())) &&
+                builtin_semantics(call, name);
     }
     if (!callee ||
         (callee->getIntrinsicID() != Intrinsic::sqrt && !library) ||

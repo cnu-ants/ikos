@@ -48,6 +48,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -1575,6 +1576,7 @@ private:
       return; // unparsable, partially parsed or NaN
     }
     bool c_zero = std::fpclassify(c) == FP_ZERO;
+    bool underflow = false;
     // v3.5.11.2: the rules below only use the sign of `c` and whether it is
     // zero. A long double constant below the double range (e.g. -1e-4900L on
     // x86_64) underflows to -0.0 in strtod, which would turn `x > c` into
@@ -1589,8 +1591,31 @@ private:
         if (ch >= '1' && ch <= '9') {
           c = text[0] == '-' ? -1.0 : 1.0;
           c_zero = false;
+          underflow = true;
           break;
         }
+      }
+    }
+    // v3.5.20: under a non-IEEE denormal mode (DAZ), a subnormal constant is
+    // read as 0: `x >= tiny` then also holds for x == 0. Rules that rely on c
+    // being nonzero are only used when c is a normal value of its format.
+    bool c_normal = !c_zero && !underflow;
+    if (c_normal) {
+      double magnitude = std::fabs(c);
+      switch (cst->type()->float_semantic()) {
+        case ar::Half:
+          c_normal = magnitude >= 6.103515625e-05;
+          break;
+        case ar::Float:
+          c_normal = magnitude >= static_cast< double >(FLT_MIN);
+          break;
+        case ar::Double:
+          c_normal = magnitude >= DBL_MIN;
+          break;
+        default:
+          // x86_fp80 / fp128: any value representable in a double that did
+          // not underflow is far above their smallest normal value.
+          break;
       }
     }
     bool gt = false, ge = false, lt = false, le = false, ne = false, eq = false;
@@ -1621,8 +1646,9 @@ private:
       default:
         return;
     }
-    if ((gt && (c > 0 || c_zero)) || (ge && c > 0) || (lt && (c < 0 || c_zero)) ||
-        (le && c < 0) || (ne && c_zero) || (eq && !c_zero)) {
+    if ((gt && (c > 0 || c_zero)) || (ge && c > 0 && c_normal) ||
+        (lt && (c < 0 || c_zero)) || (le && c < 0 && c_normal) ||
+        (ne && c_zero) || (eq && !c_zero && c_normal)) {
       this->assume_float_non_zero(var, s->parent());
     }
   }
