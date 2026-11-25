@@ -44,6 +44,9 @@
 #include <algorithm>
 #include <limits>
 
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/GlobalVariable.h>
+
 #include <ikos/ar/verify/type.hpp>
 
 #include <ikos/analyzer/checker/buffer_overflow.hpp>
@@ -1211,6 +1214,54 @@ boost::optional< BufferOverflowChecker::IntInterval > BufferOverflowChecker::
   }
 
   auto width = this->_size_type->bit_width();
+
+  // v3.5.7.1: a constant global (e.g. a format string "%d\n") cannot change
+  // during execution; writing it is undefined behavior. Its contents may
+  // still be forgotten by the analysis (e.g. after an unknown or recursive
+  // call). Read the terminator from the definitive LLVM initializer instead.
+  if (auto addr = addrs.singleton()) {
+    if (auto global = dyn_cast< GlobalMemoryLocation >(*addr)) {
+      ar::GlobalVariable* ar_gv = global->global_var();
+      llvm::GlobalVariable* gv =
+          ar_gv->has_frontend() ? ar_gv->frontend< llvm::GlobalVariable >()
+                                : nullptr;
+      if (gv != nullptr && gv->isConstant() &&
+          gv->hasDefinitiveInitializer() && offset->fits< uint64_t >()) {
+        const llvm::Constant* init = gv->getInitializer();
+        uint64_t start = offset->to< uint64_t >();
+        boost::optional< uint64_t > length;
+        std::string contents;
+        if (auto data = llvm::dyn_cast< llvm::ConstantDataSequential >(init)) {
+          if (data->getElementByteSize() == 1 &&
+              start < data->getNumElements()) {
+            for (uint64_t i = start; i < data->getNumElements(); ++i) {
+              uint64_t byte = data->getElementAsInteger(static_cast< unsigned >(i));
+              if (byte == 0) {
+                length = i - start + 1;
+                break;
+              }
+              contents.push_back(static_cast< char >(byte));
+            }
+          }
+        } else if (llvm::isa< llvm::ConstantAggregateZero >(init)) {
+          length = 1;
+        }
+        if (length) {
+          auto bytes = MachineInt(*length, width, Unsigned);
+          if (text) {
+            *text = contents;
+          }
+          IntInterval result(bytes, bytes);
+          if (precision) {
+            result = IntInterval(std::min(result.lb(), precision->lb()),
+                                 std::min(result.ub(), precision->ub()));
+          }
+          return result;
+        }
+      }
+    }
+  }
+
   auto minimum = MachineInt::max(width, Unsigned);
   auto maximum = MachineInt::zero(width, Unsigned);
   for (auto addr : addrs) {
