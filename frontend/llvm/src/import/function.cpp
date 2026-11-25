@@ -1197,51 +1197,73 @@ bool FunctionImporter::translate_narrow_signed_update(
     return false;
   }
 
-  // One extra sign bit suffices for a signed +/-1. Truncating afterwards
-  // preserves the exact modular LLVM result even at the narrow boundaries,
-  // without reporting a carry of the signed representation as unsigned
-  // source overflow or introducing an nsw assumption on the narrow result.
+  // v3.5.10.1: translate the update as a signed operation of the narrow
+  // type itself. C computes `++c` as `(char)((int)c + 1)`; when the result
+  // leaves the range of the narrow type, the value silently changes (an
+  // implementation-defined conversion, e.g. 127 -> -128). This is reported
+  // as a signed integer overflow of the narrow type, as CWE-190 expects.
+  // A guarded update (e.g. `if (c < CHAR_MAX) ++c;`) stays in range and is
+  // not reported. Unsigned narrow types are not affected.
   auto narrow_type =
       ar::IntegerType::get(this->_context, type->getBitWidth(), ar::Signed);
-  auto wide_type =
-      ar::IntegerType::get(this->_context, type->getBitWidth() + 1, ar::Signed);
-  auto widen = [&](llvm::Value* value) -> ar::Value* {
-    if (llvm::isa< llvm::Constant >(value)) {
-      return this->translate_cast_integer_value(bb_translation,
-                                                value,
-                                                wide_type);
+  {
+    auto narrow = [&](llvm::Value* value) -> ar::Value* {
+      if (llvm::isa< llvm::Constant >(value)) {
+        return this->translate_cast_integer_value(bb_translation,
+                                                  value,
+                                                  narrow_type);
+      }
+      // The operand of `++x` on memory is usually a load just before. That
+      // load may have been typed unsigned (no nsw/nuw on the update), and
+      // casting its unsigned interval back to signed loses a range learned
+      // on the signed value (e.g. `if (x < CHAR_MAX) ++x;`). If no write can
+      // happen in between, read the same address again with the signed type.
+      if (auto load = llvm::dyn_cast< llvm::LoadInst >(value)) {
+        bool clean = load->isSimple() && load->getParent() == inst->getParent();
+        for (auto it = std::next(load->getIterator());
+             clean && &*it != inst;
+             ++it) {
+          clean = !it->mayWriteToMemory();
+        }
+        if (clean) {
+          auto ptr_type = ar::PointerType::get(this->_context, narrow_type);
+          ar::Value* pointer = this->translate_value(bb_translation,
+                                                     load->getPointerOperand(),
+                                                     ptr_type);
+          auto reloaded = ar::InternalVariable::create(this->_body, narrow_type);
+          reloaded->set_frontend< llvm::Value >(load);
+          auto stmt = ar::Load::create(reloaded,
+                                       pointer,
+                                       load->getAlign().value(),
+                                       /*is_volatile=*/false);
+          stmt->set_frontend< llvm::Value >(load);
+          bb_translation->add_statement(std::move(stmt));
+          return reloaded;
+        }
+      }
+      return this->translate_value(bb_translation, value, narrow_type);
+    };
+    auto left = narrow(inst->getOperand(0));
+    auto right = narrow(inst->getOperand(1));
+    auto result = var->type() == narrow_type
+                      ? var
+                      : ar::InternalVariable::create(this->_body, narrow_type);
+    result->set_frontend< llvm::Value >(inst);
+    auto operation = ar::BinaryOperation::
+        create(inst->getOpcode() == llvm::Instruction::Add
+                   ? ar::BinaryOperation::SAdd
+                   : ar::BinaryOperation::SSub,
+               result,
+               left,
+               right);
+    operation->set_frontend< llvm::Value >(inst);
+    bb_translation->add_statement(std::move(operation));
+    if (result != var) {
+      this->add_bitcast(bb_translation, var, result);
     }
-    auto operand = this->translate_value(bb_translation, value, narrow_type);
-    return this->add_integer_casts(bb_translation,
-                                   ar::cast< ar::Variable >(operand),
-                                   wide_type);
-  };
-  auto left = widen(inst->getOperand(0));
-  auto right = widen(inst->getOperand(1));
-  auto result = ar::InternalVariable::create(this->_body, wide_type);
-  result->set_frontend< llvm::Value >(inst);
-  auto operation =
-      ar::BinaryOperation::create(inst->getOpcode() == llvm::Instruction::Add
-                                      ? ar::BinaryOperation::SAdd
-                                      : ar::BinaryOperation::SSub,
-                                  result,
-                                  left,
-                                  right);
-  operation->set_frontend< llvm::Value >(inst);
-  bb_translation->add_statement(std::move(operation));
-
-  auto truncated = var->type() == narrow_type
-                       ? var
-                       : ar::InternalVariable::create(this->_body, narrow_type);
-  truncated->set_frontend< llvm::Value >(inst);
-  auto truncate =
-      ar::UnaryOperation::create(ar::UnaryOperation::STrunc, truncated, result);
-  truncate->set_frontend< llvm::Value >(inst);
-  bb_translation->add_statement(std::move(truncate));
-  if (truncated != var) {
-    this->add_bitcast(bb_translation, var, truncated);
+    return true;
   }
-  return true;
+
 }
 
 void FunctionImporter::translate_binary_operator(
