@@ -1541,7 +1541,6 @@ private:
     }
   }
 
-  /// \brief Execute a floating point comparison
   /// \brief Learn `x != 0.0` from a floating point comparison (v3.5.11.1)
   ///
   /// The comparison statement holds on this path. Against a constant c:
@@ -1567,10 +1566,28 @@ private:
     const std::string& text = cst->value();
     char* end = nullptr;
     double c = std::strtod(text.c_str(), &end);
-    if (end == text.c_str() || std::isnan(c)) { // unparsable or NaN
-      return;
+    if (end == text.c_str() || *end != '\0' || std::isnan(c)) {
+      return; // unparsable, partially parsed or NaN
     }
     bool c_zero = std::fpclassify(c) == FP_ZERO;
+    // v3.5.11.2: the rules below only use the sign of `c` and whether it is
+    // zero. A long double constant below the double range (e.g. -1e-4900L on
+    // x86_64) underflows to -0.0 in strtod, which would turn `x > c` into
+    // `x > 0`. A zero is only taken as zero if all its digits are 0;
+    // otherwise keep the written sign of the nonzero constant. (Overflow to
+    // an infinity keeps the sign as well.)
+    if (c_zero) {
+      for (char ch : text) {
+        if (ch == 'e' || ch == 'E') {
+          break;
+        }
+        if (ch >= '1' && ch <= '9') {
+          c = text[0] == '-' ? -1.0 : 1.0;
+          c_zero = false;
+          break;
+        }
+      }
+    }
     bool gt = false, ge = false, lt = false, le = false, ne = false, eq = false;
     switch (s->predicate()) {
       case ar::Comparison::FOGT:
@@ -1605,6 +1622,7 @@ private:
     }
   }
 
+  /// \brief Execute a floating point comparison
   void exec_float_comparison(const ScalarLit& left, const ScalarLit& right) {
     // TODO(marthaud): add floating point reasoning
 
