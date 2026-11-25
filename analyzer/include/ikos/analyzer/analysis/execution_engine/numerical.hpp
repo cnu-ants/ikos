@@ -2200,25 +2200,13 @@ public:
         this->exec_snprintf(call);
       } break;
       case ar::Intrinsic::LibcScanf: {
-        this->exec_unknown_call(call,
-                                /* may_write_params = */ true,
-                                /* ignore_unknown_write = */ true,
-                                /* may_write_globals = */ false,
-                                /* may_throw_exc = */ false);
+        this->exec_scanf(call, 0, false);
       } break;
       case ar::Intrinsic::LibcFscanf: {
-        this->exec_unknown_call(call,
-                                /* may_write_params = */ true,
-                                /* ignore_unknown_write = */ true,
-                                /* may_write_globals = */ false,
-                                /* may_throw_exc = */ false);
+        this->exec_scanf(call, 1, true);
       } break;
       case ar::Intrinsic::LibcSscanf: {
-        this->exec_unknown_call(call,
-                                /* may_write_params = */ true,
-                                /* ignore_unknown_write = */ true,
-                                /* may_write_globals = */ false,
-                                /* may_throw_exc = */ false);
+        this->exec_scanf(call, 1, false);
       } break;
       case ar::Intrinsic::LibcFopen: {
         this->exec_fopen(call);
@@ -3264,6 +3252,258 @@ private:
       this->_inv.normal().pointer_assign(lhs.var(), ptr.var());
       this->_inv.normal().nullity_set(lhs.var(),
                                       Nullity::top()); // Returns null on errors
+    }
+  }
+
+  struct ScanWrite {
+    unsigned argument;
+    boost::optional< MachineInt > size;
+  };
+
+  struct ScanPlan {
+    std::vector< ScanWrite > writes;
+    unsigned assignments = 0;
+  };
+
+  /// \brief Maximum write size for a well-typed scalar/string conversion.
+  /// An opaque or incompatible destination keeps the whole-object fallback.
+  boost::optional< MachineInt > scan_write_size(ar::Type* type,
+                                                char conversion,
+                                                const std::string& length,
+                                                const core::ZNumber& width) {
+    if (!type->is_pointer()) {
+      return boost::none;
+    }
+    auto element = cast< ar::PointerType >(type)->pointee();
+    bool scalar = false;
+    if (std::string("diouxXn").find(conversion) != std::string::npos &&
+        element->is_integer()) {
+      auto bits = cast< ar::IntegerType >(element)->bit_width();
+      scalar = (length.empty() && bits == 32) ||
+               (length == "hh" && bits == 8) || (length == "h" && bits == 16) ||
+               (length == "l" && (bits == 32 || bits == 64)) ||
+               ((length == "ll" || length == "j") && bits == 64) ||
+               ((length == "z" || length == "t") &&
+                bits == this->_data_layout.pointers.bit_width);
+    } else if (std::string("aAeEfFgG").find(conversion) != std::string::npos &&
+               element->is_float()) {
+      auto semantic = cast< ar::FloatType >(element)->float_semantic();
+      scalar = (length.empty() && semantic == ar::Float) ||
+               (length == "l" && semantic == ar::Double) ||
+               (length == "L" && semantic != ar::Half && semantic != ar::Float);
+    } else if (conversion == 'p') {
+      scalar = element->is_pointer();
+    }
+    // A C object can include ABI padding (notably x86 long double). Havoc
+    // its allocation size rather than only the LLVM store width.
+    core::ZNumber bytes(0);
+    if (conversion == 'c' || conversion == 's' || conversion == '[') {
+      if (!element->is_integer()) {
+        return boost::none;
+      }
+      auto bits = cast< ar::IntegerType >(element)->bit_width();
+      if (!((length.empty() && bits == 8) ||
+            (length == "l" && (bits == 16 || bits == 32)))) {
+        return boost::none;
+      }
+      bytes = this->_data_layout.alloc_size_in_bytes(element);
+      if (conversion == 'c') {
+        bytes *= width == 0 ? core::ZNumber(1) : width;
+      } else {
+        if (width == 0) {
+          return boost::none; // Unbounded string/scanset.
+        }
+        bytes *= width + 1; // Includes the terminating null character.
+      }
+    } else if (!scalar) {
+      return boost::none;
+    } else {
+      bytes = this->_data_layout.alloc_size_in_bytes(element);
+    }
+    auto bits = this->_data_layout.pointers.bit_width;
+    if (bytes > MachineInt::max(bits, Unsigned).to_z_number()) {
+      return boost::none;
+    }
+    return MachineInt(bytes, bits, Unsigned);
+  }
+
+  /// \brief Parse the complete known format before changing any destinations.
+  /// Positional arguments, extensions and malformed formats retain the generic
+  /// unknown-call model. Suppression consumes neither an argument nor a count.
+  boost::optional< ScanPlan > scan_plan(ar::CallBase* call,
+                                        unsigned format_index,
+                                        const std::string& format) {
+    ScanPlan plan;
+    unsigned argument = format_index + 1;
+    auto max_width =
+        MachineInt::max(this->_data_layout.pointers.bit_width, Unsigned)
+            .to_z_number();
+    for (std::size_t i = 0; i < format.size(); ++i) {
+      if (format[i] != '%') {
+        continue;
+      }
+      if (++i == format.size()) {
+        return boost::none;
+      }
+      if (format[i] == '%') {
+        continue;
+      }
+      bool suppressed = format[i] == '*';
+      if (suppressed && ++i == format.size()) {
+        return boost::none;
+      }
+      core::ZNumber width(0);
+      bool has_width = false;
+      while (i < format.size() && format[i] >= '0' && format[i] <= '9') {
+        has_width = true;
+        width = width * 10 + (format[i++] - '0');
+        if (width > max_width) {
+          return boost::none;
+        }
+      }
+      if ((has_width && width == 0) || i == format.size()) {
+        return boost::none;
+      }
+      std::string length;
+      if (std::string("hljztL").find(format[i]) != std::string::npos) {
+        length.push_back(format[i++]);
+        if (i < format.size() && (length == "h" || length == "l") &&
+            format[i] == length[0]) {
+          length.push_back(format[i++]);
+        }
+      }
+      if (i == format.size()) {
+        return boost::none;
+      }
+      char conversion = format[i];
+      bool integer =
+          std::string("diouxXn").find(conversion) != std::string::npos;
+      bool floating =
+          std::string("aAeEfFgG").find(conversion) != std::string::npos;
+      bool text = conversion == 'c' || conversion == 's' || conversion == '[';
+      if ((!integer && !floating && !text && conversion != 'p') ||
+          (integer && length == "L") ||
+          (floating && !length.empty() && length != "l" && length != "L") ||
+          (text && !length.empty() && length != "l") ||
+          (conversion == 'p' && !length.empty()) ||
+          (conversion == 'n' && (suppressed || has_width))) {
+        return boost::none;
+      }
+      if (conversion == '[') {
+        if (++i < format.size() && format[i] == '^') {
+          ++i;
+        }
+        if (i < format.size() && format[i] == ']') {
+          ++i;
+        }
+        while (i < format.size() && format[i] != ']') {
+          ++i;
+        }
+        if (i == format.size()) {
+          return boost::none;
+        }
+      }
+      if (suppressed) {
+        continue;
+      }
+      if (argument >= call->num_arguments() ||
+          !call->argument(argument)->type()->is_pointer()) {
+        return boost::none;
+      }
+      plan.writes.push_back(
+          {argument,
+           this->scan_write_size(call->argument(argument)->type(),
+                                 conversion,
+                                 length,
+                                 width)});
+      ++argument;
+      if (conversion != 'n') {
+        ++plan.assignments;
+      }
+    }
+    return plan;
+  }
+
+  /// \brief Model scanf/fscanf/sscanf without erasing unrelated subobjects.
+  void exec_scanf(ar::CallBase* call,
+                  unsigned format_index,
+                  bool writes_stream) {
+    this->init_global_operands(call);
+    const ScalarLit& format =
+        this->_lit_factory.get_scalar(call->argument(format_index));
+    auto bytes = format.is_pointer_var()
+                     ? this->known_string_bytes(format.var(), 4096, true)
+                     : boost::optional< std::string >();
+    auto plan = bytes ? this->scan_plan(call, format_index, *bytes)
+                      : boost::optional< ScanPlan >();
+    // If an output can rewrite the format itself, its initial contents need
+    // not describe the rest of the call. Do not use a precomputed plan then.
+    bool may_rewrite_format = false;
+    if (plan) {
+      auto format_addrs =
+          this->_inv.normal().pointer_to_points_to(format.var());
+      for (const auto& write : plan->writes) {
+        const ScalarLit& pointer =
+            this->_lit_factory.get_scalar(call->argument(write.argument));
+        if (!pointer.is_pointer_var()) {
+          continue;
+        }
+        this->refine_addresses(pointer.var());
+        auto addrs = this->_inv.normal().pointer_to_points_to(pointer.var());
+        if (format_addrs.is_top() || addrs.is_top()) {
+          may_rewrite_format = true;
+          break;
+        }
+        for (auto address : format_addrs) {
+          if (addrs.contains(address)) {
+            may_rewrite_format = true;
+            break;
+          }
+        }
+        if (may_rewrite_format) {
+          break;
+        }
+      }
+    }
+    if (!plan || may_rewrite_format) {
+      this->exec_unknown_call(call, true, true, false, false);
+      return;
+    }
+    // fscanf can also update its FILE object. sscanf's source and all three
+    // format strings are inputs, not output buffers.
+    if (writes_stream) {
+      const ScalarLit& stream =
+          this->_lit_factory.get_scalar(call->argument(0));
+      if (stream.is_pointer_var()) {
+        this->refine_addresses(stream.var());
+        if (!this->_inv.normal().pointer_to_points_to(stream.var()).is_top()) {
+          this->_inv.normal().mem_forget_reachable(stream.var());
+        }
+      }
+    }
+    for (const auto& write : plan->writes) {
+      const ScalarLit& pointer =
+          this->_lit_factory.get_scalar(call->argument(write.argument));
+      if (!pointer.is_pointer_var()) {
+        continue;
+      }
+      if (write.size) {
+        this->_inv.normal().mem_forget_reachable(pointer.var(), *write.size);
+      } else {
+        this->_inv.normal().mem_forget_reachable(pointer.var());
+      }
+    }
+    if (call->has_result()) {
+      const ScalarLit& result = this->_lit_factory.get_scalar(call->result());
+      auto type = cast< ar::IntegerType >(call->result()->type());
+      this->_inv.normal().int_assign_nondet(result.var());
+      // EOF is negative. An upper bound is sufficient, without hardcoding its
+      // target-specific value or claiming every conversion succeeded.
+      this->_inv.normal().int_add(IntPredicate::LE,
+                                  result.var(),
+                                  MachineInt(plan->assignments,
+                                             type->bit_width(),
+                                             Signed));
     }
   }
 
