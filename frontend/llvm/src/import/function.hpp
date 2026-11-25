@@ -329,6 +329,11 @@ private:
   void translate_binary_operator(BasicBlockTranslation* bb_translation,
                                  llvm::BinaryOperator* inst);
 
+  /// \brief Restore a narrow signed unit update as wide arithmetic and truncation
+  bool translate_narrow_signed_update(BasicBlockTranslation* bb_translation,
+                                      llvm::BinaryOperator* inst,
+                                      ar::InternalVariable* var);
+
   /// \brief Translate a llvm::CmpInst
   void translate_cmp(BasicBlockTranslation* bb_translation, llvm::CmpInst* cmp);
 
