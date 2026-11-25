@@ -333,7 +333,12 @@ private:
         call->doesNotAccessMemory() || call->onlyReadsMemory()) {
       return true;
     }
-    auto callee = call->getCalledFunction();
+    // v3.5.21: a call to a function declared without prototype goes through
+    // a bitcast on x86_64 (e.g. `int globalReturnsTrueOrFalse();`). Look
+    // through the cast: only the callee body is inspected here, so the call
+    // signature does not matter (argument bindings are not used).
+    auto callee = llvm::dyn_cast< llvm::Function >(
+        call->getCalledOperand()->stripPointerCasts());
     if (!callee) {
       return false;
     }
