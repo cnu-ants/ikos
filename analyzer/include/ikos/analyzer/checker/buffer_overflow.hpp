@@ -43,6 +43,7 @@
 
 #pragma once
 
+#include <string>
 #include <utility>
 
 #include <llvm/ADT/SmallVector.h>
@@ -152,11 +153,14 @@ private:
   /// \param access_size The access size operand (in bytes)
   /// \param if_null Result if the pointer is null
   /// \param inv The invariant
-  CheckResult check_mem_access(ar::Statement* stmt,
-                               ar::Value* pointer,
-                               ar::Value* access_size,
-                               Result if_null,
-                               value::AbstractDomain inv);
+  /// \param read_size Computed string access interval, if provided
+  CheckResult check_mem_access(
+      ar::Statement* stmt,
+      ar::Value* pointer,
+      ar::Value* access_size,
+      Result if_null,
+      value::AbstractDomain inv,
+      boost::optional< IntInterval > read_size = boost::none);
 
   /// \brief Check a memory access (read/write) at the given memory location
   ///
@@ -186,6 +190,36 @@ private:
       Variable* offset_plus_size,
       const IntInterval& offset_intv,
       JsonDict& block_info);
+
+  /// \brief Read a byte in a copy of the abstract memory, without changing
+  /// the invariant used by the analysis.
+  IntInterval read_string_byte(value::AbstractDomain& inv,
+                               Variable* pointer,
+                               const MachineInt& index);
+
+  /// \brief Bound the read through the terminator or first out-of-bounds byte.
+  /// An unknown byte may be a terminator; it must not prove either safety or
+  /// definite overflow. Scanning is bounded to keep checking costs finite.
+  boost::optional< IntInterval > string_read_size(
+      ar::Value* pointer,
+      const boost::optional< IntInterval >& precision,
+      value::AbstractDomain inv,
+      boost::optional< std::string >* text = nullptr);
+
+  /// \brief Check an actual read of a NUL-terminated narrow string.
+  CheckResult check_string_read(
+      ar::Statement* stmt,
+      ar::Value* pointer,
+      Result if_null,
+      const value::AbstractDomain& inv,
+      const boost::optional< IntInterval >& precision = boost::none);
+
+  /// \brief Decode known printf formats before checking their pointer
+  /// arguments.
+  std::vector< CheckResult > check_printf_arguments(
+      ar::CallBase* call,
+      unsigned format_index,
+      const value::AbstractDomain& inv);
 
   /// \brief Check a string access (read/write) for buffer overflow
   ///

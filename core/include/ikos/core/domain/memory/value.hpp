@@ -1826,7 +1826,7 @@ public:
 
     if (value.is_machine_int()) {
       value_intv = IntInterval(value.machine_int());
-    } else if (size.is_machine_int_var()) {
+    } else if (value.is_machine_int_var()) {
       value_intv = this->_scalar.int_to_interval(value.var());
     } else {
       ikos_unreachable("unexpected literal for value");
@@ -1836,7 +1836,7 @@ public:
       return; // Does nothing
     }
 
-    if (value_intv.is_zero()) {
+    if (value_intv.is_zero() && !size_intv.lb().is_zero()) {
       // Memory set to zero
       const MachineInt& size_lb = size_intv.lb();
       auto zero = MachineInt::zero(size_lb.bit_width(), Unsigned);
@@ -1884,6 +1884,33 @@ public:
       // To be sound, remove all reachable cells
       for (MemoryLocationRef addr : addrs) {
         this->mem_forget_cells(addr, dest_intv, size_intv.ub());
+      }
+    }
+
+    // Materialize a bounded prefix of bytes that are certainly written.
+    // Keeping the wide cells above preserves integer/pointer precision, while
+    // these byte cells preserve zeros across subsequent partial byte stores.
+    auto byte = value_intv.cast(8, Unsigned).singleton();
+    auto offset = dest_intv.singleton();
+    if (addrs.singleton() && offset && byte && !size_intv.lb().is_zero()) {
+      auto count = std::min(size_intv.lb().to_z_number(), ZNumber(4096))
+                       .template to< unsigned >();
+      auto last = offset->to_z_number() + count - 1;
+      if (last <=
+          MachineInt::max(offset->bit_width(), Unsigned).to_z_number()) {
+        MemoryLocationRef addr = *addrs.singleton();
+        CellSetT cells = this->_cells.get(addr);
+        for (unsigned i = 0; i < count; ++i) {
+          VariableRef cell =
+              this->make_cell(addr,
+                              *offset +
+                                  MachineInt(i, offset->bit_width(), Unsigned),
+                              MachineInt(1, offset->bit_width(), Unsigned),
+                              Unsigned);
+          this->_scalar.dynamic_write_int(cell, *byte);
+          cells.add(cell);
+        }
+        this->_cells.set(addr, cells);
       }
     }
 
