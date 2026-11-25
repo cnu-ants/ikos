@@ -747,6 +747,14 @@ public:
     this->_scalar.float_assign(x, y);
   }
 
+  void float_set_zero(VariableRef x, const FloatZero& value) override {
+    this->_scalar.float_set_zero(x, value);
+  }
+
+  FloatZero float_to_zero(VariableRef x) const override {
+    return this->_scalar.float_to_zero(x);
+  }
+
   void float_forget(VariableRef x) override { this->_scalar.float_forget(x); }
 
   /// @}
@@ -1291,8 +1299,9 @@ private:
       }
     }
 
-    void floating_point(const DummyNumber&) {
+    void floating_point(const DummyNumber& value) {
       this->_scalar.dynamic_write_nondet_float(this->_lhs);
+      this->_scalar.float_set_zero(this->_lhs, value.zero);
     }
 
     void memory_location(MemoryLocationRef addr) {
@@ -1314,8 +1323,10 @@ private:
       }
     }
 
-    void floating_point_var(VariableRef /*rhs*/) {
+    void floating_point_var(VariableRef rhs) {
+      auto value = this->_scalar.float_to_zero(rhs);
       this->_scalar.dynamic_write_nondet_float(this->_lhs);
+      this->_scalar.float_set_zero(this->_lhs, value);
     }
 
     void pointer_var(VariableRef rhs) {
@@ -1372,8 +1383,15 @@ private:
       // Forget the previous value before copying the cell's initializedness.
       // float_assign_nondet() would mark the result as initialized.
       this->_scalar.float_forget(lhs);
-      this->_scalar.uninit_refine(
-          lhs, this->_scalar.uninit_to_uninitialized(this->_rhs));
+      this->_scalar.uninit_refine(lhs,
+                                  this->_scalar.uninit_to_uninitialized(
+                                      this->_rhs));
+      auto value = this->_scalar.float_to_zero(this->_rhs);
+      if (value.is_top() && this->_scalar.uninit_is_initialized(this->_rhs) &&
+          this->_scalar.dynamic_is_zero(this->_rhs)) {
+        value = FloatZero::raw_zero();
+      }
+      this->_scalar.float_set_zero(lhs, value);
     }
 
     void pointer_var(VariableRef lhs) {

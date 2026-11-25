@@ -1042,6 +1042,20 @@ public:
     }
   }
 
+  void float_set_zero(VariableRef x, const FloatZero& value) override {
+    for (Partition& partition : this->_partitions) {
+      partition.memory.float_set_zero(x, value);
+    }
+  }
+
+  FloatZero float_to_zero(VariableRef x) const override {
+    auto result = FloatZero::bottom();
+    for (const Partition& partition : this->_partitions) {
+      result.join_with(partition.memory.float_to_zero(x));
+    }
+    return result;
+  }
+
   void float_forget(VariableRef x) override {
     for (Partition& partition : this->_partitions) {
       partition.memory.float_forget(x);

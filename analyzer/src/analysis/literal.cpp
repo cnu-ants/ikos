@@ -45,6 +45,9 @@
 
 #include <boost/thread/locks.hpp>
 
+#include <llvm/ADT/APFloat.h>
+#include <llvm/Support/Error.h>
+
 #include <ikos/ar/semantic/value_visitor.hpp>
 
 #include <ikos/analyzer/analysis/literal.hpp>
@@ -194,8 +197,43 @@ public:
     return Literal(ScalarLit::machine_int(c->value()));
   }
 
-  Literal operator()(ar::FloatConstant* /*f*/) {
-    return Literal(ScalarLit::floating_point(DummyNumber{}));
+  Literal operator()(ar::FloatConstant* f) {
+    const llvm::fltSemantics* semantics = nullptr;
+    switch (f->type()->float_semantic()) {
+      case ar::Half:
+        semantics = &llvm::APFloat::IEEEhalf();
+        break;
+      case ar::Float:
+        semantics = &llvm::APFloat::IEEEsingle();
+        break;
+      case ar::Double:
+        semantics = &llvm::APFloat::IEEEdouble();
+        break;
+      case ar::X86_FP80:
+        semantics = &llvm::APFloat::x87DoubleExtended();
+        break;
+      case ar::FP128:
+        semantics = &llvm::APFloat::IEEEquad();
+        break;
+      case ar::PPC_FP128:
+        break; // Retain unknown for double-double encoding.
+    }
+    DummyNumber value;
+    if (semantics) {
+      llvm::APFloat number(*semantics);
+      auto status =
+          number.convertFromString(f->value(),
+                                   llvm::APFloat::rmNearestTiesToEven);
+      if (status) {
+        auto format = static_cast< uint64_t >(f->type()->float_semantic()) + 1;
+        value.zero = number.isZero()       ? core::FloatZero::zero(format)
+                     : number.isDenormal() ? core::FloatZero::subnormal(format)
+                                           : core::FloatZero::other(format);
+      } else {
+        llvm::consumeError(status.takeError());
+      }
+    }
+    return Literal(ScalarLit::floating_point(value));
   }
 
   Literal operator()(ar::NullConstant* /*n*/) {

@@ -480,8 +480,9 @@ private:
 
     void machine_int(const MachineInt&) { ikos_unreachable("unreachable"); }
 
-    void floating_point(const DummyNumber&) {
+    void floating_point(const DummyNumber& value) {
       this->_inv.normal().float_assign_nondet(this->_lhs);
+      this->_inv.normal().float_set_zero(this->_lhs, value.zero);
     }
 
     void memory_location(MemoryLocation*) { ikos_unreachable("unreachable"); }
@@ -618,8 +619,9 @@ private:
 
     void machine_int(const MachineInt&) { ikos_unreachable("unreachable"); }
 
-    void floating_point(const DummyNumber&) {
+    void floating_point(const DummyNumber& value) {
       this->_inv.normal().float_assign_nondet(this->_lhs);
+      this->_inv.normal().float_set_zero(this->_lhs, value.zero);
     }
 
     void memory_location(MemoryLocation*) { ikos_unreachable("unreachable"); }
@@ -2317,8 +2319,42 @@ public:
     }
   }
 
+private:
+  // Keep this bounded even for deeply nested aggregate types. Pointers are
+  // deliberately not followed: this query concerns the global object itself.
+  static bool contains_float(ar::Type* type, unsigned depth = 0) {
+    if (depth >= 32 || type->is_float()) {
+      return true;
+    }
+    if (auto sequential = dyn_cast< ar::SequentialType >(type)) {
+      return contains_float(sequential->element_type(), depth + 1);
+    }
+    if (auto structure = dyn_cast< ar::StructType >(type)) {
+      for (const auto& field : structure->layout()) {
+        if (contains_float(field.type, depth + 1)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+public:
   /// \brief Execute a call to an unknown extern function
   void exec_unknown_extern_call(ar::CallBase* call) override {
+    // Unknown external code may update a floating global without receiving its
+    // address as an argument. Do not let the new FP facts certify a subsequent
+    // division using stale contents. Other global types retain the existing
+    // external-call policy; pointer argument invalidation remains below.
+    for (auto it = this->_ctx.bundle->global_begin(),
+              end = this->_ctx.bundle->global_end();
+         it != end;
+         ++it) {
+      ar::GlobalVariable* global = *it;
+      if (contains_float(global->type()->pointee())) {
+        this->_inv.normal().mem_forget(this->_mem_factory.get_global(global));
+      }
+    }
     this->exec_unknown_call(call,
                             /* may_write_params = */ true,
                             /* ignore_unknown_write = */ true,

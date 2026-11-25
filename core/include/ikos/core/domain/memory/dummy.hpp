@@ -390,6 +390,14 @@ public:
     this->_scalar.float_assign(x, y);
   }
 
+  void float_set_zero(VariableRef x, const FloatZero& value) override {
+    this->_scalar.float_set_zero(x, value);
+  }
+
+  FloatZero float_to_zero(VariableRef x) const override {
+    return this->_scalar.float_to_zero(x);
+  }
+
   void float_forget(VariableRef x) override { this->_scalar.float_forget(x); }
 
   /// @}
