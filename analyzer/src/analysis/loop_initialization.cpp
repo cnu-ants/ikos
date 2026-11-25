@@ -22,14 +22,61 @@ namespace ikos {
 namespace analyzer {
 namespace {
 
-llvm::AllocaInst* stack_object(llvm::Value* pointer) {
+/// \brief Return true if `call` is a heap allocation with a fixed byte size
+///
+/// Supported: malloc(n), operator new(n), operator new[](n), with a constant
+/// size. The returned object is fresh, so its contents are only reachable
+/// through the returned pointer.
+bool heap_allocation_size(const llvm::CallBase* call, uint64_t& size) {
+  const llvm::Function* callee = call->getCalledFunction();
+  if (!callee || call->arg_size() < 1) {
+    return false;
+  }
+  llvm::StringRef name = callee->getName();
+  if (name != "malloc" && name != "_Znwm" && name != "_Znam" &&
+      name != "_Znwj" && name != "_Znaj") {
+    return false;
+  }
+  auto bytes = llvm::dyn_cast< llvm::ConstantInt >(call->getArgOperand(0));
+  if (!bytes || bytes->getBitWidth() > 64 || bytes->isZero()) {
+    return false;
+  }
+  size = bytes->getZExtValue();
+  return true;
+}
+
+/// \brief Return true if `call` only deallocates `object`
+bool is_deallocation_of(const llvm::CallBase* call, const llvm::Value* object) {
+  const llvm::Function* callee = call->getCalledFunction();
+  if (!callee || call->arg_size() < 1 || call->getArgOperand(0) != object) {
+    return false;
+  }
+  for (unsigned i = 1; i < call->arg_size(); ++i) {
+    // Sized delete passes the size as an integer, never the object again.
+    if (call->getArgOperand(i) == object) {
+      return false;
+    }
+  }
+  llvm::StringRef name = callee->getName();
+  return name == "free" || name == "_ZdlPv" || name == "_ZdaPv" ||
+         name == "_ZdlPvm" || name == "_ZdaPvm" || name == "_ZdlPvj" ||
+         name == "_ZdaPvj";
+}
+
+/// \brief Return the root object (stack slot or fixed-size heap allocation)
+llvm::Value* memory_object(llvm::Value* pointer) {
   for (unsigned depth = 0; depth < 32; ++depth) {
     if (auto gep = llvm::dyn_cast< llvm::GEPOperator >(pointer)) {
       pointer = gep->getPointerOperand();
     } else if (auto cast = llvm::dyn_cast< llvm::BitCastInst >(pointer)) {
       pointer = cast->getOperand(0);
+    } else if (llvm::isa< llvm::AllocaInst >(pointer)) {
+      return pointer;
+    } else if (auto call = llvm::dyn_cast< llvm::CallBase >(pointer)) {
+      uint64_t size;
+      return heap_allocation_size(call, size) ? pointer : nullptr;
     } else {
-      return llvm::dyn_cast< llvm::AllocaInst >(pointer);
+      return nullptr;
     }
   }
   return nullptr;
@@ -241,7 +288,7 @@ class LoopInitializationProof {
     return true;
   }
 
-  bool object_uses(llvm::AllocaInst* object) {
+  bool object_uses(llvm::Value* object) {
     llvm::SmallVector< llvm::Value*, 16 > worklist{object};
     llvm::SmallPtrSet< llvm::Value*, 32 > visited;
     while (!worklist.empty()) {
@@ -256,6 +303,22 @@ class LoopInitializationProof {
         if (llvm::isa< llvm::GetElementPtrInst >(user) ||
             llvm::isa< llvm::BitCastInst >(user)) {
           worklist.push_back(user);
+        } else if (auto cmp = llvm::dyn_cast< llvm::ICmpInst >(user)) {
+          // A null check (e.g. after malloc) neither writes nor escapes.
+          if (!cmp->isEquality() ||
+              !llvm::isa< llvm::ConstantPointerNull >(
+                  cmp->getOperand(cmp->getOperand(0) == pointer ? 1 : 0))) {
+            return false;
+          }
+        } else if (auto call = llvm::dyn_cast< llvm::CallBase >(user)) {
+          // Deallocation ends the lifetime; it cannot initialize contents.
+          // Any read after it is a use-after-free, reported by other checks.
+          // Only the object itself (possibly through pointer casts) may be
+          // released; a pointer into the middle of the object may not.
+          if (pointer->stripPointerCasts() != object ||
+              !is_deallocation_of(call, pointer)) {
+            return false;
+          }
         } else if (auto load = llvm::dyn_cast< llvm::LoadInst >(user)) {
           if (!load->isSimple() || load->getPointerOperand() != pointer) {
             return false;
@@ -277,7 +340,7 @@ class LoopInitializationProof {
   }
 
   bool footprint(llvm::Value* pointer,
-                 llvm::AllocaInst* object,
+                 llvm::Value* object,
                  const Counter& counter,
                  uint64_t& begin,
                  uint64_t& stride) {
@@ -360,17 +423,39 @@ public:
         this->_function.hasFnAttribute(llvm::Attribute::NullPointerIsValid)) {
       return false;
     }
-    auto object = stack_object(load->getPointerOperand());
-    if (!object || !object->isStaticAlloca() || object->isArrayAllocation() ||
-        object->getAddressSpace() != 0 ||
-        object->getFunction() != &this->_function) {
+    llvm::Value* object = memory_object(load->getPointerOperand());
+    auto object_inst = llvm::dyn_cast_or_null< llvm::Instruction >(object);
+    if (!object_inst || object_inst->getFunction() != &this->_function ||
+        // An allocation inside a loop creates a new object per iteration.
+        this->_loops.getLoopFor(object_inst->getParent()) != nullptr) {
       return false;
     }
-    auto allocation =
-        this->_layout.getTypeAllocSize(object->getAllocatedType());
+    uint64_t allocation = 0;
+    if (auto slot = llvm::dyn_cast< llvm::AllocaInst >(object)) {
+      if (slot->getAddressSpace() != 0) {
+        return false;
+      }
+      auto element = this->_layout.getTypeAllocSize(slot->getAllocatedType());
+      if (element.isScalable()) {
+        return false;
+      }
+      allocation = element.getFixedValue();
+      if (slot->isArrayAllocation()) {
+        // alloca(n) with a constant n, e.g. ALLOCA(10 * sizeof(int)).
+        auto count = llvm::dyn_cast< llvm::ConstantInt >(slot->getArraySize());
+        if (!count || count->getBitWidth() > 64 ||
+            __builtin_mul_overflow(allocation,
+                                   count->getZExtValue(),
+                                   &allocation)) {
+          return false;
+        }
+      }
+    } else if (!heap_allocation_size(llvm::cast< llvm::CallBase >(object),
+                                     allocation)) {
+      return false;
+    }
     auto bytes = this->_layout.getTypeStoreSize(load->getType());
-    if (allocation.isScalable() || bytes.isScalable() ||
-        allocation.getFixedValue() > 1024 * 1024) {
+    if (bytes.isScalable() || allocation == 0 || allocation > 1024 * 1024) {
       return false;
     }
     for (llvm::BasicBlock& block : this->_function) {
@@ -450,7 +535,7 @@ public:
               __builtin_mul_overflow(i, stride, &position) ||
               __builtin_add_overflow(position, begin, &position) ||
               __builtin_add_overflow(position, stored.getFixedValue(), &end) ||
-              end > allocation.getFixedValue()) {
+              end > allocation) {
             return false;
           }
           coverage.push_back({position, end});
@@ -474,7 +559,7 @@ public:
     auto lower = offset.interval().lb().to_z_number();
     auto upper = offset.interval().ub().to_z_number();
     auto end = upper + bytes.getFixedValue();
-    if (end > allocation.getFixedValue() || !lower.fits< uint64_t >()) {
+    if (end > allocation || !lower.fits< uint64_t >()) {
       return false;
     }
     uint64_t first = lower.to< uint64_t >();
@@ -506,7 +591,7 @@ bool prove_loop_initialized_load(
     return false;
   }
   auto inst = llvm::dyn_cast< llvm::LoadInst >(load->frontend< llvm::Value >());
-  return inst && stack_object(inst->getPointerOperand()) &&
+  return inst && memory_object(inst->getPointerOperand()) &&
          LoopInitializationProof(*inst->getFunction()).prove(inst, offset);
 }
 
