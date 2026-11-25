@@ -132,6 +132,42 @@ private:
     return call;
   }
 
+  // v3.5.8.1: two simple loads of the same address read the same value if
+  // nothing may write memory between them. Supported shapes: both loads in
+  // one block, or the second in the only successor-reached block whose single
+  // predecessor holds the first.
+  bool same_loaded_value(Value* a, Value* b) {
+    auto first = dyn_cast< LoadInst >(a);
+    auto second = dyn_cast< LoadInst >(b);
+    if (!first || !second || !first->isSimple() || !second->isSimple() ||
+        first->getPointerOperand() != second->getPointerOperand() ||
+        first->getType() != second->getType()) {
+      return false;
+    }
+    if (!_dominators.dominates(first, second)) {
+      std::swap(first, second);
+      if (!_dominators.dominates(first, second)) {
+        return false;
+      }
+    }
+    auto clean = [](BasicBlock::iterator it, BasicBlock::iterator end) {
+      for (; it != end; ++it) {
+        if (it->mayWriteToMemory()) {
+          return false;
+        }
+      }
+      return true;
+    };
+    BasicBlock* head = first->getParent();
+    BasicBlock* tail = second->getParent();
+    if (head == tail) {
+      return clean(std::next(first->getIterator()), second->getIterator());
+    }
+    return tail->getSinglePredecessor() == head &&
+           clean(std::next(first->getIterator()), head->end()) &&
+           clean(tail->begin(), second->getIterator());
+  }
+
   // The new constraints must not hide the unrepresentable abs(MIN) case.
   bool minimum_excluded(CallBase* absolute, Value* input) {
     unsigned width = input->getType()->getIntegerBitWidth();
@@ -143,20 +179,33 @@ private:
       auto comparison = branch && branch->isConditional()
                             ? dyn_cast< ICmpInst >(branch->getCondition())
                             : nullptr;
-      if (!comparison || !comparison->isEquality()) {
+      if (!comparison) {
         continue;
       }
       Value* a = this->resolve(comparison->getOperand(0));
       Value* b = this->resolve(comparison->getOperand(1));
-      if (b == input) {
+      auto predicate = comparison->getPredicate();
+      if (b == input || this->same_loaded_value(b, input)) {
         std::swap(a, b);
+        predicate = CmpInst::getSwappedPredicate(predicate);
       }
       auto number = dyn_cast< ConstantInt >(b);
-      if (a != input || !number || number->getBitWidth() != width ||
+      if ((a != input && !this->same_loaded_value(a, input)) || !number ||
+          number->getBitWidth() != width ||
           !number->getValue().isMinSignedValue()) {
         continue;
       }
-      unsigned edge = comparison->getPredicate() == CmpInst::ICMP_NE ? 0 : 1;
+      // x != MIN and x > MIN (v3.5.8.1) exclude MIN on the true edge;
+      // x == MIN and x <= MIN exclude it on the false edge.
+      unsigned edge;
+      if (predicate == CmpInst::ICMP_NE || predicate == CmpInst::ICMP_SGT) {
+        edge = 0;
+      } else if (predicate == CmpInst::ICMP_EQ ||
+                 predicate == CmpInst::ICMP_SLE) {
+        edge = 1;
+      } else {
+        continue;
+      }
       if (_dominators.dominates(BasicBlockEdge(&block,
                                                branch->getSuccessor(edge)),
                                 absolute->getParent())) {
@@ -328,13 +377,48 @@ public:
           integer->getPredicate() != CmpInst::ICMP_SLE) {
         return None;
       }
-      absolute = this->integer_abs(integer->getOperand(0));
-      auto limit = dyn_cast_or_null< ConstantInt >(
-          this->constant(integer->getOperand(1)));
-      if (!absolute || !limit || limit->getValue().isNegative()) {
+      // v3.5.8.1: `abs(x) < (long)sqrt(...)` compares the absolute value
+      // after a widening cast. abs(x) >= 0 once abs(MIN) is excluded (checked
+      // below), so sign and zero extension both preserve its value.
+      Value* lhs = this->resolve(integer->getOperand(0));
+      for (unsigned i = 0; i < 4; ++i) {
+        auto ext = dyn_cast< CastInst >(lhs);
+        if (!ext || (ext->getOpcode() != Instruction::SExt &&
+                     ext->getOpcode() != Instruction::ZExt)) {
+          break;
+        }
+        lhs = this->resolve(ext->getOperand(0));
+      }
+      absolute = this->integer_abs(lhs);
+      if (!absolute) {
         return None;
       }
-      maximum = limit->getValue();
+      Optional< APInt > limit;
+      if (auto number = dyn_cast_or_null< ConstantInt >(
+              this->constant(integer->getOperand(1)))) {
+        limit = number->getValue();
+      } else if (auto conversion = dyn_cast< FPToSIInst >(
+                     this->resolve(integer->getOperand(1)))) {
+        // v3.5.8.1: fptosi(sqrt(C)) <= trunc(upper bound of sqrt(C)).
+        auto root = this->bounds(conversion->getOperand(0));
+        if (!root || !root->upper.isFinite() || root->upper.isNegative()) {
+          return None;
+        }
+        unsigned width = conversion->getType()->getIntegerBitWidth();
+        APSInt value(width, /*isUnsigned=*/false);
+        bool exact;
+        auto status = root->upper.convertToInteger(value,
+                                                   APFloat::rmTowardZero,
+                                                   &exact);
+        if (status & (APFloat::opInvalidOp | APFloat::opOverflow)) {
+          return None;
+        }
+        limit = static_cast< APInt >(value);
+      }
+      if (!limit || limit->isNegative()) {
+        return None;
+      }
+      maximum = *limit;
       if (integer->getPredicate() == CmpInst::ICMP_SLT) {
         if (maximum->isZero()) {
           return None;
@@ -342,6 +426,16 @@ public:
         --*maximum;
       }
       input = this->resolve(absolute->getArgOperand(0));
+      // The constraint is applied to the abs input; fit it to that width.
+      unsigned input_width = input->getType()->getIntegerBitWidth();
+      if (maximum->getBitWidth() > input_width) {
+        if (maximum->getActiveBits() >= input_width) {
+          return None; // Not below the signed maximum: nothing to learn
+        }
+        maximum = maximum->trunc(input_width);
+      } else if (maximum->getBitWidth() < input_width) {
+        maximum = maximum->zext(input_width);
+      }
     } else if (auto floating = dyn_cast< FCmpInst >(comparison)) {
       if ((floating->getPredicate() != CmpInst::FCMP_OLT &&
            floating->getPredicate() != CmpInst::FCMP_OLE) ||
