@@ -358,6 +358,9 @@ public:
     BranchInst* branch;
     Value* input;
     APInt maximum;
+    // v3.5.8.2: abs(MIN) is not excluded. abs(MIN) wraps to MIN, which passes
+    // `abs(x) <= M`, so only `x <= M` holds on the true edge.
+    bool upper_only;
   };
 
   Optional< Guard > guard(BranchInst* branch) {
@@ -379,7 +382,9 @@ public:
       }
       // v3.5.8.1: `abs(x) < (long)sqrt(...)` compares the absolute value
       // after a widening cast. abs(x) >= 0 once abs(MIN) is excluded (checked
-      // below), so sign and zero extension both preserve its value.
+      // below), so sign and zero extension both preserve its value. If it is
+      // not excluded, sext(abs(MIN)) is negative and passes, still x <= M
+      // (v3.5.8.2); zext(abs(MIN)) = 2^(w-1) exceeds any M fitting in x.
       Value* lhs = this->resolve(integer->getOperand(0));
       for (unsigned i = 0; i < 4; ++i) {
         auto ext = dyn_cast< CastInst >(lhs);
@@ -501,11 +506,11 @@ public:
       }
       maximum = APInt(width, lower);
     }
-    if (!input || !maximum ||
-        (absolute && !this->minimum_excluded(absolute, input))) {
+    if (!input || !maximum) {
       return None;
     }
-    return Guard{branch, input, *maximum};
+    bool upper_only = absolute && !this->minimum_excluded(absolute, input);
+    return Guard{branch, input, *maximum, upper_only};
   }
 
   // The original condition is retained. Add necessary integer constraints on
@@ -523,7 +528,11 @@ public:
     builder.SetCurrentDebugLocation(guard.branch->getDebugLoc());
     auto type = guard.input->getType();
     auto upper = ConstantInt::get(type, guard.maximum);
-    auto lower = ConstantInt::get(type, -guard.maximum);
+    auto lower = ConstantInt::get(
+        type,
+        guard.upper_only
+            ? APInt::getSignedMinValue(type->getIntegerBitWidth())
+            : APInt(-guard.maximum));
     auto upper_check = builder.CreateICmpSLE(guard.input, upper);
     builder.CreateCondBr(upper_check, low, no);
     builder.SetInsertPoint(low);
