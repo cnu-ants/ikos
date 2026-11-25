@@ -66,6 +66,19 @@ struct FloatBounds {
   APFloat upper;
 };
 
+/// \brief C++ `abs(long)`/`abs(long long)` overloads of <cstdlib>
+/// (v3.5.8.4). libc++ defines them inline in the global namespace and
+/// libstdc++ in std; both have the meaning of labs/llabs. An inline
+/// definition from the standard header is linkonce_odr (ODR: the same
+/// definition everywhere); a program cannot redefine these functions.
+bool cxx_integer_abs(const Function* callee) {
+  StringRef name = callee->getName();
+  return (name == "_Z3absl" || name == "_ZSt3absl" || name == "_Z3absx" ||
+          name == "_ZSt3absx") &&
+         (callee->isDeclaration() || callee->hasLinkOnceODRLinkage() ||
+          callee->hasAvailableExternallyLinkage());
+}
+
 /// Restricted constant proofs and necessary integer ranges for math guards.
 /// Unsupported operations, unresolved aliases and special floating values are
 /// left to the original analysis. No host floating arithmetic is used.
@@ -117,14 +130,17 @@ private:
   CallBase* integer_abs(Value* value) {
     auto call = dyn_cast< CallBase >(this->resolve(value));
     auto callee = call ? call->getCalledFunction() : nullptr;
-    if (!callee || !callee->isDeclaration() || call->isNoBuiltin() ||
-        !call->getType()->isIntegerTy()) {
+    if (!callee || call->isNoBuiltin() || !call->getType()->isIntegerTy()) {
+      return nullptr;
+    }
+    bool cxx = cxx_integer_abs(callee);
+    if (!callee->isDeclaration() && !cxx) {
       return nullptr;
     }
     bool intrinsic = callee->getIntrinsicID() == Intrinsic::abs;
     StringRef name = callee->getName();
-    if (!(intrinsic || name == "abs" || name == "labs" || name == "llabs" ||
-          name == "imaxabs") ||
+    if (!(intrinsic || cxx || name == "abs" || name == "labs" ||
+          name == "llabs" || name == "imaxabs") ||
         call->arg_size() != (intrinsic ? 2 : 1) ||
         call->getArgOperand(0)->getType() != call->getType()) {
       return nullptr;
@@ -528,7 +544,37 @@ public:
     if (!input || !maximum) {
       return None;
     }
-    bool upper_only = absolute && !this->minimum_excluded(absolute, input);
+    // v3.5.8.4: `abs((long)c)` with a char/short c compares a sign extension
+    // (possibly truncated back to a width >= the source), e.g.
+    // `abs(trunc(sext i8 c to i64) to i32)`. Such a value is never the MIN
+    // of its type, and it has the same value as c: constrain c itself, so
+    // that later reads of c (not of the converted value) see the range.
+    bool narrow_source = false;
+    for (unsigned i = 0; i < 4; ++i) {
+      Value* inner = input;
+      if (auto trunc = dyn_cast< TruncInst >(inner)) {
+        inner = this->resolve(trunc->getOperand(0));
+        auto sext = dyn_cast< SExtInst >(inner);
+        if (!sext || sext->getSrcTy()->getIntegerBitWidth() >
+                         trunc->getDestTy()->getIntegerBitWidth()) {
+          break;
+        }
+      }
+      auto sext = dyn_cast< SExtInst >(inner);
+      if (!sext) {
+        break;
+      }
+      Value* source = this->resolve(sext->getOperand(0));
+      unsigned source_width = source->getType()->getIntegerBitWidth();
+      if (maximum->getActiveBits() >= source_width) {
+        break; // Not below the signed maximum of c: nothing to learn on c
+      }
+      maximum = maximum->trunc(source_width);
+      input = source;
+      narrow_source = true;
+    }
+    bool upper_only = absolute && !narrow_source &&
+                      !this->minimum_excluded(absolute, input);
     return Guard{branch, input, *maximum, upper_only};
   }
 
@@ -657,7 +703,8 @@ struct ProveConstantFloatComparisonPass final : public FunctionPass {
         if (callee &&
             (callee->getIntrinsicID() == Intrinsic::abs ||
              callee->getName() == "abs" || callee->getName() == "labs" ||
-             callee->getName() == "llabs" || callee->getName() == "imaxabs")) {
+             callee->getName() == "llabs" || callee->getName() == "imaxabs" ||
+             cxx_integer_abs(callee))) {
           has_integer_abs = true;
           break;
         }
