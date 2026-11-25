@@ -41,7 +41,7 @@
 cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
 
 project(ikos)
-set(PACKAGE_VERSION "3.5.10.1")
+set(PACKAGE_VERSION "3.5.5.1")
 
 #
 # Build settings
