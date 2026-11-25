@@ -284,6 +284,142 @@ public:
   }
 };
 
+/// v3.5.18: Prove an integer divisor nonzero from a dominating comparison of
+/// the same value with a constant (e.g. `if (data != 0) { 100 / data; }`).
+///
+/// The interval domain cannot represent "every value but 0", so this check
+/// is syntactic. The compared value and the divisor are equated only if they
+/// are the same SSA value (up to zero-preserving casts), or two simple loads
+/// of the same pointer on a single path without any write in between.
+class IntDivisorProof {
+private:
+  llvm::DominatorTree _dominators;
+  const llvm::DataLayout& _layout;
+
+public:
+  explicit IntDivisorProof(llvm::Function& function)
+      : _dominators(function), _layout(function.getParent()->getDataLayout()) {}
+
+private:
+  /// \brief Strip casts c such that c(x) != 0 implies x != 0
+  static llvm::Value* strip_guard(llvm::Value* value) {
+    for (unsigned i = 0; i < 4; ++i) {
+      auto cast = llvm::dyn_cast< llvm::CastInst >(value);
+      if (!cast || !(cast->getOpcode() == llvm::Instruction::SExt ||
+                     cast->getOpcode() == llvm::Instruction::ZExt ||
+                     cast->getOpcode() == llvm::Instruction::Trunc)) {
+        break;
+      }
+      value = cast->getOperand(0);
+    }
+    return value;
+  }
+
+  /// \brief Strip casts c such that x != 0 implies c(x) != 0
+  static llvm::Value* strip_divisor(llvm::Value* value) {
+    for (unsigned i = 0; i < 4; ++i) {
+      auto cast = llvm::dyn_cast< llvm::CastInst >(value);
+      if (!cast || !(cast->getOpcode() == llvm::Instruction::SExt ||
+                     cast->getOpcode() == llvm::Instruction::ZExt)) {
+        break;
+      }
+      value = cast->getOperand(0);
+    }
+    return value;
+  }
+
+  static bool writes_between(llvm::BasicBlock::iterator begin,
+                             llvm::BasicBlock::iterator end) {
+    for (auto it = begin; it != end; ++it) {
+      if (it->mayWriteToMemory()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// \brief Return true if `later` reads the value read by `first`
+  static bool same_loaded_value(llvm::Value* first, llvm::Value* later) {
+    auto a = llvm::dyn_cast< llvm::LoadInst >(first);
+    auto b = llvm::dyn_cast< llvm::LoadInst >(later);
+    if (!a || !b || !a->isSimple() || !b->isSimple() ||
+        a->getPointerOperand() != b->getPointerOperand() ||
+        a->getType() != b->getType()) {
+      return false;
+    }
+    llvm::BasicBlock* block = b->getParent();
+    llvm::BasicBlock::iterator end = b->getIterator();
+    // Walk back along single predecessors from `later` to `first`.
+    for (unsigned i = 0; i < 8; ++i) {
+      if (block == a->getParent()) {
+        if (end != block->end() && !a->comesBefore(&*end)) {
+          return false;
+        }
+        return !writes_between(std::next(a->getIterator()), end);
+      }
+      if (writes_between(block->begin(), end)) {
+        return false;
+      }
+      block = block->getSinglePredecessor();
+      if (block == nullptr) {
+        return false;
+      }
+      end = block->end();
+    }
+    return false;
+  }
+
+  bool same_value(llvm::Value* guarded, llvm::Value* divisor) {
+    guarded = strip_guard(guarded);
+    divisor = strip_divisor(divisor);
+    return guarded == divisor || same_loaded_value(guarded, divisor);
+  }
+
+public:
+  bool nonzero(llvm::BinaryOperator& division) {
+    llvm::Value* divisor = division.getOperand(1);
+    for (llvm::BasicBlock& block : *division.getFunction()) {
+      auto branch = llvm::dyn_cast< llvm::BranchInst >(block.getTerminator());
+      auto comparison =
+          branch && branch->isConditional()
+              ? llvm::dyn_cast< llvm::ICmpInst >(branch->getCondition())
+              : nullptr;
+      if (!comparison || branch->getSuccessor(0) == branch->getSuccessor(1)) {
+        continue;
+      }
+      for (unsigned index = 0; index < 2; ++index) {
+        auto other =
+            llvm::dyn_cast< llvm::ConstantInt >(comparison->getOperand(1 - index));
+        llvm::Value* operand = comparison->getOperand(index);
+        if (!other || !operand->getType()->isIntegerTy()) {
+          continue;
+        }
+        // The edge on which the comparison is false for operand == 0 excludes
+        // 0. Casts are stripped only after this evaluation.
+        auto zero = llvm::ConstantInt::get(operand->getType(), 0);
+        auto folded = llvm::dyn_cast_or_null< llvm::ConstantInt >(
+            llvm::ConstantFoldCompareInstOperands(comparison->getPredicate(),
+                                                  index == 0 ? zero : other,
+                                                  index == 0 ? other : zero,
+                                                  this->_layout));
+        if (!folded) {
+          continue;
+        }
+        unsigned edge = folded->isZero() ? 0 : 1;
+        if (!this->_dominators.dominates(
+                llvm::BasicBlockEdge(&block, branch->getSuccessor(edge)),
+                division.getParent())) {
+          continue;
+        }
+        if (this->same_value(operand, divisor)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+};
+
 } // namespace
 
 DivisionByZeroChecker::DivisionByZeroChecker(Context& ctx) : Checker(ctx) {}
@@ -412,7 +548,8 @@ DivisionByZeroChecker::CheckResult DivisionByZeroChecker::check_division(
     }
     return {CheckKind::DivisionByZero, Result::Error, {}};
   } else if (divisor.contains(
-                 MachineInt::zero(divisor.bit_width(), divisor.sign()))) {
+                 MachineInt::zero(divisor.bit_width(), divisor.sign())) &&
+             !this->guarded_nonzero(stmt)) {
     // The second operand may be 0
     if (auto msg = this->display_division_check(Result::Warning, stmt)) {
       *msg << ": ∃d ∈ divisor, d == 0\n";
@@ -425,6 +562,24 @@ DivisionByZeroChecker::CheckResult DivisionByZeroChecker::check_division(
     }
     return {CheckKind::DivisionByZero, Result::Ok, {}};
   }
+}
+
+bool DivisionByZeroChecker::guarded_nonzero(ar::BinaryOperation* stmt) const {
+  if (!stmt->has_frontend()) {
+    return false;
+  }
+  auto division =
+      llvm::dyn_cast< llvm::BinaryOperator >(stmt->frontend< llvm::Value >());
+  if (!division || division->getFunction() == nullptr ||
+      !(division->getOpcode() == llvm::Instruction::SDiv ||
+        division->getOpcode() == llvm::Instruction::UDiv ||
+        division->getOpcode() == llvm::Instruction::SRem ||
+        division->getOpcode() == llvm::Instruction::URem) ||
+      !division->getType()->isIntegerTy()) {
+    return false;
+  }
+  IntDivisorProof proof(*division->getFunction());
+  return proof.nonzero(*division);
 }
 
 llvm::Optional< LogMessage > DivisionByZeroChecker::display_division_check(
