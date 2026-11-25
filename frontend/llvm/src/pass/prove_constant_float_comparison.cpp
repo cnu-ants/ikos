@@ -280,9 +280,23 @@ private:
     }
     auto call = dyn_cast< CallBase >(value);
     auto callee = call ? call->getCalledFunction() : nullptr;
-    // Only the correctly rounded LLVM intrinsic is supported here. External
-    // sqrt/sqrtl implementations and constrained FP operations remain unknown.
-    if (!callee || callee->getIntrinsicID() != Intrinsic::sqrt ||
+    // The correctly rounded LLVM intrinsic, or (v3.5.8.3) the C library
+    // sqrt/sqrtf/sqrtl declared outside the module. Clang emits the library
+    // call instead of the intrinsic under -fmath-errno (the Linux default).
+    // The bounds below are the two representable neighbours of the real root
+    // (or integer bounds for other formats): any faithfully rounded sqrt,
+    // and in particular the correctly rounded IEEE 754 one, is within them.
+    // A sqrt defined in the module and constrained FP operations are unknown.
+    bool library = false;
+    if (callee && callee->isDeclaration() && !callee->isVarArg()) {
+      auto name = callee->getName();
+      auto type = call->getType();
+      library = (name == "sqrt" && type->isDoubleTy()) ||
+                (name == "sqrtf" && type->isFloatTy()) ||
+                (name == "sqrtl" && type->isFloatingPointTy());
+    }
+    if (!callee ||
+        (callee->getIntrinsicID() != Intrinsic::sqrt && !library) ||
         call->arg_size() != 1 || call->getFastMathFlags().any() ||
         call->getMetadata(LLVMContext::MD_fpmath) ||
         call->getArgOperand(0)->getType() != call->getType()) {
@@ -448,7 +462,12 @@ public:
         return None;
       }
       auto type = floating->getOperand(0)->getType();
-      if (!(type->isHalfTy() || type->isFloatTy() || type->isDoubleTy())) {
+      // v3.5.8.3: also x86 long double / quad (e.g. Linux `imaxabs(x) <=
+      // sqrtl(LLONG_MAX)`). Only an exact ordered comparison of an integer
+      // conversion with the bounds of the limit is used here; the bounds of
+      // these formats are integer bounds (see bounds()).
+      if (!(type->isHalfTy() || type->isFloatTy() || type->isDoubleTy() ||
+            type->isX86_FP80Ty() || type->isFP128Ty())) {
         return None;
       }
       Value* lhs = this->resolve(floating->getOperand(0));
