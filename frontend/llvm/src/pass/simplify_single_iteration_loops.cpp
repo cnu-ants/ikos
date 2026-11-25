@@ -43,6 +43,7 @@
 
 #include <utility>
 
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/IR/Constants.h>
@@ -139,13 +140,43 @@ struct SimplifySingleIterationLoopsPass final : public llvm::FunctionPass {
     return true;
   }
 
+  /// \brief Collect the targets of the exits other than the header test
+  ///
+  /// v3.5.15.1: an exit to a block ending in `unreachable` (e.g. the
+  /// `exit(-1)` of `if (p == NULL) { exit(-1); }`) never comes back, so it is
+  /// allowed. Any other extra exit is rejected.
+  static bool noreturn_exits(
+      llvm::Loop* loop,
+      llvm::BasicBlock* header,
+      llvm::SmallPtrSetImpl< llvm::BasicBlock* >& targets) {
+    llvm::SmallVector< llvm::Loop::Edge, 4 > edges;
+    loop->getExitEdges(edges);
+    for (const auto& edge : edges) {
+      const llvm::BasicBlock* from = edge.first;
+      llvm::BasicBlock* to = const_cast< llvm::BasicBlock* >(edge.second);
+      if (from == header) {
+        continue;
+      }
+      if (!llvm::isa< llvm::UnreachableInst >(to->getTerminator()) ||
+          to->hasAddressTaken() || to->getSinglePredecessor() != from) {
+        return false;
+      }
+      targets.insert(to);
+    }
+    return true;
+  }
+
   static bool simplify(llvm::Loop* loop, llvm::DominatorTree& dominators) {
     auto* header = loop->getHeader();
     auto* preheader = loop->getLoopPreheader();
     auto* latch = loop->getLoopLatch();
     auto* branch = llvm::dyn_cast< llvm::BranchInst >(header->getTerminator());
+    // v3.5.15.1: sub-loops are allowed. Only the header is cloned and the
+    // back edge redirected; body blocks (including inner loops) are kept as
+    // is and run once. An inner exit leaving this loop makes it multi-exit.
+    llvm::SmallPtrSet< llvm::BasicBlock*, 4 > noreturn;
     if (!preheader || !latch || header == latch || header->hasAddressTaken() ||
-        !loop->getSubLoops().empty() || loop->getExitingBlock() != header ||
+        !noreturn_exits(loop, header, noreturn) ||
         !branch || !branch->isConditional() ||
         !loop->contains(branch->getSuccessor(0)) ||
         loop->contains(branch->getSuccessor(1))) {
@@ -231,8 +262,10 @@ struct SimplifySingleIterationLoopsPass final : public llvm::FunctionPass {
       }
       for (llvm::Use& use : inst.uses()) {
         auto* user = llvm::dyn_cast< llvm::Instruction >(use.getUser());
+        // A noreturn exit runs during the single iteration: keep the
+        // first-iteration value there (v3.5.15.1).
         if (user && !loop->contains(user->getParent()) &&
-            user->getParent() != final) {
+            user->getParent() != final && noreturn.count(user->getParent()) == 0) {
           replacements.emplace_back(&use, values[&inst]);
         }
       }
