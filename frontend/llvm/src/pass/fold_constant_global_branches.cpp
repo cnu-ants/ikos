@@ -140,8 +140,15 @@ private:
       return it->second;
     }
     if (auto call = llvm::dyn_cast< llvm::CallInst >(value)) {
-      auto callee = call->getCalledFunction();
-      if (callee == nullptr || call->arg_size() != 0) {
+      // v3.5.17.1: a call to a function declared without prototype
+      // (`int globalReturnsTrue();`) goes through a bitcast to `i32 (...)`
+      // on x86_64 once linked with its definition. Look through the cast,
+      // with no argument on either side and the same return type.
+      auto callee = llvm::dyn_cast< llvm::Function >(
+          call->getCalledOperand()->stripPointerCasts());
+      if (callee == nullptr || call->arg_size() != 0 ||
+          callee->arg_size() != 0 ||
+          callee->getReturnType() != call->getType()) {
         return nullptr;
       }
       auto it = this->_functions.find(callee);
