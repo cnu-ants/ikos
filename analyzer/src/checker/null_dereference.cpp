@@ -370,6 +370,7 @@ std::vector< NullDereferenceChecker::CheckResult > NullDereferenceChecker::
       return {this->check_null(call, call->argument(0), inv)};
     }
     // <string.h>
+    case ar::Intrinsic::LibcWcslen:
     case ar::Intrinsic::LibcStrlen:
     case ar::Intrinsic::LibcStrnlen: {
       return {this->check_null(call, call->argument(0), inv)};

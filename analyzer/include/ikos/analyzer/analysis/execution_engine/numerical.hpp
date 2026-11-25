@@ -2233,6 +2233,10 @@ public:
                                 /* may_write_globals = */ false,
                                 /* may_throw_exc = */ false);
       } break;
+      // <wchar.h>
+      case ar::Intrinsic::LibcWcslen: {
+        this->exec_wcslen(call);
+      } break;
       // <string.h>
       case ar::Intrinsic::LibcStrlen: {
         this->exec_strlen(call);
@@ -3357,6 +3361,76 @@ private:
       ikos_assert_msg(lhs.is_machine_int_var(),
                       "left hand side is not an integer variable");
       this->_inv.normal().int_assign_nondet(lhs.var());
+    }
+  }
+
+  /// \brief Execute the read-only wide string length operation
+  ///
+  /// As for strlen, assume a well-formed string. Bound its length by the
+  /// number of complete wide characters remaining in the containing object,
+  /// reserving one character for the terminator. Do not forget string contents.
+  void exec_wcslen(ar::CallBase* call) {
+    this->init_global_operands(call);
+    const ScalarLit& str = this->_lit_factory.get_scalar(call->argument(0));
+    if (!this->prepare_mem_access(str) || !call->has_result()) {
+      return;
+    }
+
+    const ScalarLit& lhs = this->_lit_factory.get_scalar(call->result());
+    ikos_assert(lhs.is_machine_int_var());
+    this->_inv.normal().int_assign_nondet(lhs.var());
+
+    PointsToSet addrs = this->_inv.normal().pointer_to_points_to(str.var());
+    if (addrs.is_top()) {
+      return;
+    }
+
+    auto element_ty =
+        cast< ar::PointerType >(call->argument(0)->type())->pointee();
+    auto element_size = this->_data_layout.store_size_in_bytes(element_ty);
+    IntInterval offset =
+        this->_inv.normal().pointer_offset_to_interval(str.var());
+    auto result_ty = cast< ar::IntegerType >(call->result()->type());
+    boost::optional< AbstractDomain > inv = boost::none;
+
+    for (MemoryLocation* addr : addrs) {
+      AbstractDomain tmp = this->_inv;
+      IntInterval size = IntInterval::top(offset.bit_width(), Unsigned);
+      if (auto gv = dyn_cast< GlobalMemoryLocation >(addr)) {
+        size = IntInterval(MachineInt(this->_data_layout.store_size_in_bytes(
+                                          gv->global_var()->type()->pointee()),
+                                      offset.bit_width(),
+                                      Unsigned));
+      } else {
+        Variable* size_var = this->_var_factory.get_alloc_size(addr);
+        size = tmp.normal().int_to_interval(size_var);
+      }
+
+      // Use mathematical integers: subtracting an offset or the terminator
+      // in size_t arithmetic could wrap and invent a small length bound.
+      auto remaining = size.ub().to_z_number() - offset.lb().to_z_number();
+      if (remaining < element_size) {
+        tmp.set_normal_flow_to_bottom(); // No complete terminator can fit.
+      } else {
+        auto max_length = remaining / element_size - 1;
+        tmp.normal().int_add(IntPredicate::LE,
+                             lhs.var(),
+                             MachineInt(max_length,
+                                        result_ty->bit_width(),
+                                        result_ty->sign()));
+      }
+
+      if (!inv) {
+        inv = std::move(tmp);
+      } else {
+        inv->join_with(tmp);
+      }
+    }
+
+    if (inv) {
+      this->_inv = std::move(*inv);
+    } else {
+      this->_inv.set_normal_flow_to_bottom();
     }
   }
 

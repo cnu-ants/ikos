@@ -762,6 +762,7 @@ private:
         case ar::Intrinsic::LibcFflush:
           break; // do nothing
         // <string.h>
+        case ar::Intrinsic::LibcWcslen:
         case ar::Intrinsic::LibcStrlen:
         case ar::Intrinsic::LibcStrnlen:
           break; // do nothing

@@ -132,6 +132,8 @@ public:
     LibcFopen,
     LibcFclose,
     LibcFflush,
+    // <wchar.h>
+    LibcWcslen,
     // <string.h>
     LibcStrlen,
     LibcStrnlen,
