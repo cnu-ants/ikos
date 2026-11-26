@@ -1702,8 +1702,28 @@ public:
   ///
   /// Writing an uninitialized variable is an error.
   void exec(ar::Store* s) override {
-    if (s->has_undefined_constant_operand()) {
+    if (isa< ar::UndefinedConstant >(s->pointer())) {
+      // Storing through an undefined pointer is undefined behavior.
       this->_inv.set_normal_flow_to_bottom();
+      return;
+    }
+
+    if (isa< ar::UndefinedConstant >(s->value())) {
+      // Storing undef makes the destination memory unknown (TOP).
+      // Using no-op would leave a previous concrete value intact, which is
+      // unsound. Setting to bottom would kill valid paths (e.g. globals
+      // initialized with 'undef' such as std::piecewise_construct).
+      // Instead, forget the cells at the destination so reads return TOP.
+      this->init_global_operands(s);
+      const ScalarLit& ptr = this->_lit_factory.get_scalar(s->pointer());
+      if (!this->prepare_mem_access(ptr)) {
+        return;
+      }
+      auto size =
+          MachineInt(this->_data_layout.store_size_in_bytes(s->value()->type()),
+                     this->_data_layout.pointers.bit_width,
+                     Unsigned);
+      this->_inv.normal().mem_forget_reachable(ptr.var(), size);
       return;
     }
 
