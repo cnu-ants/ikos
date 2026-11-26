@@ -41,6 +41,12 @@
  *
  ******************************************************************************/
 
+#include <algorithm>
+#include <limits>
+
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/GlobalVariable.h>
+
 #include <ikos/ar/verify/type.hpp>
 
 #include <ikos/analyzer/checker/buffer_overflow.hpp>
@@ -388,16 +394,16 @@ std::vector< BufferOverflowChecker::CheckResult > BufferOverflowChecker::
       return {};
     }
     case ar::Intrinsic::LibcPuts: {
-      return {this->check_string_access(call,
-                                        call->argument(0),
-                                        /* if_null = */ Result::Error,
-                                        inv)};
+      return {this->check_string_read(call,
+                                      call->argument(0),
+                                      /* if_null = */ Result::Error,
+                                      inv)};
     }
     case ar::Intrinsic::LibcFputs: {
-      return {this->check_string_access(call,
-                                        call->argument(0),
-                                        /* if_null = */ Result::Error,
-                                        inv),
+      return {this->check_string_read(call,
+                                      call->argument(0),
+                                      /* if_null = */ Result::Error,
+                                      inv),
               this->check_file_access(call,
                                       call->argument(1),
                                       /* if_null = */ Result::Error,
@@ -411,96 +417,38 @@ std::vector< BufferOverflowChecker::CheckResult > BufferOverflowChecker::
                                       inv)};
     }
     case ar::Intrinsic::LibcPrintf: {
-      std::vector< CheckResult > checks = {
-          this->check_string_access(call,
-                                    call->argument(0),
-                                    /* if_null = */ Result::Error,
-                                    inv)};
-      for (auto it = call->arg_begin() + 1, et = call->arg_end(); it != et;
-           ++it) {
-        ar::Value* arg = *it;
-        if (arg->type()->is_pointer()) {
-          checks.push_back(this->check_string_access(call,
-                                                     arg,
-                                                     /* if_null = */ Result::Ok,
-                                                     inv));
-        }
-      }
-      return checks;
+      return this->check_printf_arguments(call, 0, inv);
     }
     case ar::Intrinsic::LibcFprintf: {
-      std::vector< CheckResult > checks =
-          {this->check_file_access(call,
-                                   call->argument(0),
-                                   /* if_null = */ Result::Error,
-                                   inv),
-           this->check_string_access(call,
-                                     call->argument(1),
-                                     /* if_null = */ Result::Error,
-                                     inv)};
-      for (auto it = call->arg_begin() + 2, et = call->arg_end(); it != et;
-           ++it) {
-        ar::Value* arg = *it;
-        if (arg->type()->is_pointer()) {
-          checks.push_back(this->check_string_access(call,
-                                                     arg,
-                                                     /* if_null = */ Result::Ok,
-                                                     inv));
-        }
-      }
+      auto checks = this->check_printf_arguments(call, 1, inv);
+      checks.insert(checks.begin(),
+                    this->check_file_access(call,
+                                            call->argument(0),
+                                            Result::Error,
+                                            inv));
       return checks;
     }
     case ar::Intrinsic::LibcSprintf: {
-      std::vector< CheckResult > checks =
-          {this->check_string_access(call,
-                                     call->argument(0),
-                                     /* if_null = */ Result::Error,
-                                     inv),
-           this->check_string_access(call,
-                                     call->argument(1),
-                                     /* if_null = */ Result::Error,
-                                     inv)};
-      for (auto it = call->arg_begin() + 2, et = call->arg_end(); it != et;
-           ++it) {
-        ar::Value* arg = *it;
-        if (arg->type()->is_pointer()) {
-          checks.push_back(this->check_string_access(call,
-                                                     arg,
-                                                     /* if_null = */ Result::Ok,
-                                                     inv));
-        }
-      }
+      auto checks = this->check_printf_arguments(call, 1, inv);
+      checks.insert(checks.begin(),
+                    this->check_string_access(call,
+                                              call->argument(0),
+                                              Result::Error,
+                                              inv));
       return checks;
     }
     case ar::Intrinsic::LibcSnprintf: {
-      std::vector< CheckResult > checks = {};
-
-      // Calling snprintf with zero bufsz and null pointer buffer can be used
-      // to determine the buffer size needed to contain the output. That case
-      // is allowed. Otherwise, check first argument.
+      auto checks = this->check_printf_arguments(call, 2, inv);
+      // A zero-sized snprintf does not access its output buffer. The format
+      // and its string arguments are still read to compute the output length.
       auto bufsz = this->_lit_factory.get_scalar(call->argument(1));
       if (!(bufsz.is_machine_int() && bufsz.machine_int().is_zero())) {
-        checks.push_back(this->check_mem_access(call,
-                                                call->argument(0),
-                                                call->argument(1),
-                                                /* if_null = */ Result::Error,
-                                                inv));
-      }
-
-      checks.push_back(this->check_string_access(call,
-                                                 call->argument(2),
-                                                 /* if_null = */ Result::Error,
-                                                 inv));
-
-      for (auto it = call->arg_begin() + 3, et = call->arg_end(); it != et;
-           ++it) {
-        ar::Value* arg = *it;
-        if (arg->type()->is_pointer()) {
-          checks.push_back(this->check_string_access(call,
-                                                     arg,
-                                                     /* if_null = */ Result::Ok,
-                                                     inv));
-        }
+        checks.insert(checks.begin(),
+                      this->check_mem_access(call,
+                                             call->argument(0),
+                                             call->argument(1),
+                                             Result::Error,
+                                             inv));
       }
       return checks;
     }
@@ -599,10 +547,10 @@ std::vector< BufferOverflowChecker::CheckResult > BufferOverflowChecker::
     }
     // <string.h>
     case ar::Intrinsic::LibcStrlen: {
-      return {this->check_string_access(call,
-                                        call->argument(0),
-                                        /* if_null = */ Result::Error,
-                                        inv)};
+      return {this->check_string_read(call,
+                                      call->argument(0),
+                                      /* if_null = */ Result::Error,
+                                      inv)};
     }
     case ar::Intrinsic::LibcStrnlen: {
       return {this->check_mem_access(call,
@@ -772,7 +720,8 @@ BufferOverflowChecker::CheckResult BufferOverflowChecker::check_mem_access(
     ar::Value* pointer,
     ar::Value* access_size,
     Result if_null,
-    value::AbstractDomain inv) {
+    value::AbstractDomain inv,
+    boost::optional< IntInterval > read_size) {
   if (inv.is_normal_flow_bottom()) {
     // Statement unreachable
     if (auto msg = this->display_mem_access_check(Result::Unreachable,
@@ -871,7 +820,9 @@ BufferOverflowChecker::CheckResult BufferOverflowChecker::check_mem_access(
   info.put("offset", to_json(offset_intv));
 
   auto size_intv = IntInterval::bottom(1, Signed);
-  if (size.is_machine_int_var()) {
+  if (read_size) {
+    size_intv = *read_size;
+  } else if (size.is_machine_int_var()) {
     size_intv = inv.normal().int_to_interval(size.var());
   } else if (size.is_machine_int()) {
     size_intv = IntInterval(size.machine_int());
@@ -889,7 +840,16 @@ BufferOverflowChecker::CheckResult BufferOverflowChecker::check_mem_access(
       _ctx.var_factory->get_named_shadow(this->_size_type,
                                          "shadow.offset_plus_size");
 
-  if (access_size->type() == this->_size_type) {
+  if (read_size) {
+    Variable* string_size =
+        _ctx.var_factory->get_named_shadow(this->_size_type,
+                                           "shadow.string_read_size");
+    inv.normal().int_set(string_size, *read_size);
+    inv.normal().int_apply(IntBinaryOperator::Add,
+                           offset_plus_size,
+                           offset_var,
+                           string_size);
+  } else if (access_size->type() == this->_size_type) {
     if (size.is_machine_int_var()) {
       inv.normal().int_apply(IntBinaryOperator::Add,
                              offset_plus_size,
@@ -1208,6 +1168,390 @@ BufferOverflowChecker::MemoryLocationCheckResult BufferOverflowChecker::
     }
     return {BufferOverflowCheckKind::OutOfBound, Result::Warning};
   }
+}
+
+BufferOverflowChecker::IntInterval BufferOverflowChecker::read_string_byte(
+    value::AbstractDomain& inv, Variable* pointer, const MachineInt& index) {
+  auto byte_type = ar::IntegerType::get(this->_ar_context, 8, Signed);
+  auto scan_type = ar::PointerType::get(this->_ar_context, byte_type);
+  Variable* scan =
+      _ctx.var_factory->get_named_shadow(scan_type, "shadow.string_scan");
+  Variable* byte =
+      _ctx.var_factory->get_named_shadow(byte_type, "shadow.string_byte");
+  inv.normal().pointer_assign(scan, pointer, index);
+  inv.normal().mem_read(ScalarLit::machine_int_var(byte),
+                        scan,
+                        MachineInt(1, this->_size_type->bit_width(), Unsigned));
+  // Uninitialized memory cannot establish a character value.
+  if (inv.is_normal_flow_bottom() ||
+      !inv.normal().uninit_is_initialized(byte)) {
+    return IntInterval::top(8, Signed);
+  }
+  return inv.normal().int_to_interval(byte);
+}
+
+boost::optional< BufferOverflowChecker::IntInterval > BufferOverflowChecker::
+    string_read_size(ar::Value* pointer,
+                     const boost::optional< IntInterval >& precision,
+                     value::AbstractDomain inv,
+                     boost::optional< std::string >* text) {
+  if (text) {
+    *text = boost::none;
+  }
+  if (inv.is_normal_flow_bottom()) {
+    return boost::none;
+  }
+  const auto& ptr = this->_lit_factory.get_scalar(pointer);
+  if (!ptr.is_pointer_var() ||
+      inv.normal().uninit_is_uninitialized(ptr.var())) {
+    return boost::none;
+  }
+  this->init_global_ptr(inv, pointer);
+  auto addrs = inv.normal().pointer_to_points_to(ptr.var());
+  auto offset = inv.normal().pointer_offset_to_interval(ptr.var()).singleton();
+  if (addrs.is_top() || addrs.is_empty() || !offset) {
+    return boost::none;
+  }
+
+  auto width = this->_size_type->bit_width();
+
+  // v3.5.7.1: a constant global (e.g. a format string "%d\n") cannot change
+  // during execution; writing it is undefined behavior. Its contents may
+  // still be forgotten by the analysis (e.g. after an unknown or recursive
+  // call). Read the terminator from the definitive LLVM initializer instead.
+  if (auto addr = addrs.singleton()) {
+    if (auto global = dyn_cast< GlobalMemoryLocation >(*addr)) {
+      ar::GlobalVariable* ar_gv = global->global_var();
+      llvm::GlobalVariable* gv =
+          ar_gv->has_frontend() ? ar_gv->frontend< llvm::GlobalVariable >()
+                                : nullptr;
+      if (gv != nullptr && gv->isConstant() &&
+          gv->hasDefinitiveInitializer() && offset->fits< uint64_t >()) {
+        const llvm::Constant* init = gv->getInitializer();
+        uint64_t start = offset->to< uint64_t >();
+        boost::optional< uint64_t > length;
+        std::string contents;
+        if (auto data = llvm::dyn_cast< llvm::ConstantDataSequential >(init)) {
+          if (data->getElementByteSize() == 1 &&
+              start < data->getNumElements()) {
+            for (uint64_t i = start; i < data->getNumElements(); ++i) {
+              uint64_t byte = data->getElementAsInteger(static_cast< unsigned >(i));
+              if (byte == 0) {
+                length = i - start + 1;
+                break;
+              }
+              contents.push_back(static_cast< char >(byte));
+            }
+          }
+        } else if (llvm::isa< llvm::ConstantAggregateZero >(init)) {
+          length = 1;
+        }
+        if (length) {
+          auto bytes = MachineInt(*length, width, Unsigned);
+          if (text) {
+            *text = contents;
+          }
+          IntInterval result(bytes, bytes);
+          if (precision) {
+            result = IntInterval(std::min(result.lb(), precision->lb()),
+                                 std::min(result.ub(), precision->ub()));
+          }
+          return result;
+        }
+      }
+    }
+  }
+
+  auto minimum = MachineInt::max(width, Unsigned);
+  auto maximum = MachineInt::zero(width, Unsigned);
+  for (auto addr : addrs) {
+    auto size_var = _ctx.var_factory->get_alloc_size(addr);
+    this->init_global_alloc_size(inv, addr, size_var);
+    auto size = inv.normal().int_to_interval(size_var);
+    if (size.is_bottom() || size.ub().is_max() || size.lb() <= *offset) {
+      return boost::none;
+    }
+    minimum = std::min(minimum, size.lb() - *offset);
+    maximum = std::max(maximum, size.ub() - *offset);
+  }
+  // The final byte represents the first invalid read, not a claim about the
+  // length of an unterminated string. Avoid modular addition in the checker.
+  auto one = MachineInt(1, width, Unsigned);
+  if (maximum.is_max() ||
+      (maximum + one) > MachineInt::max(width, Unsigned) - *offset) {
+    return boost::none;
+  }
+  auto lower = one;
+  auto upper = maximum + one;
+  auto count = std::min(minimum.to_z_number(), ZNumber(4096)).to< unsigned >();
+  if (precision && precision->ub() < MachineInt(count, width, Unsigned)) {
+    count = precision->ub().to< unsigned >();
+  }
+  bool possible_zero = false;
+  bool constant_text = true;
+  std::string contents;
+  for (unsigned i = 0; i < count; ++i) {
+    auto byte =
+        this->read_string_byte(inv, ptr.var(), MachineInt(i, width, Unsigned));
+    auto value = byte.singleton();
+    if (!possible_zero) {
+      lower = MachineInt(i + 1, width, Unsigned);
+      if (byte.contains(MachineInt(0, 8, Signed))) {
+        possible_zero = true;
+      } else {
+        lower = MachineInt(i + 2, width, Unsigned);
+      }
+    }
+    if (value && value->is_zero()) {
+      upper = MachineInt(i + 1, width, Unsigned);
+      if (text && constant_text) {
+        *text = contents;
+      }
+      break;
+    }
+    if (value && constant_text) {
+      contents.push_back(static_cast< char >(value->to< int >()));
+    } else {
+      constant_text = false;
+    }
+  }
+  if (precision) {
+    lower = std::min(lower, precision->lb());
+    upper = std::min(upper, precision->ub());
+  }
+  return IntInterval(lower, upper);
+}
+
+BufferOverflowChecker::CheckResult BufferOverflowChecker::check_string_read(
+    ar::Statement* stmt,
+    ar::Value* pointer,
+    Result if_null,
+    const value::AbstractDomain& inv,
+    const boost::optional< IntInterval >& precision) {
+  if (precision && precision->ub().is_zero() && !inv.is_normal_flow_bottom()) {
+    return {CheckKind::BufferOverflow,
+            Result::Ok,
+            {pointer, this->_size_zero},
+            {}};
+  }
+  auto size = this->string_read_size(pointer, precision, inv);
+  if (size) {
+    auto access_size = ar::IntegerConstant::get(this->_ar_context,
+                                                this->_size_type,
+                                                size->ub());
+    return this
+        ->check_mem_access(stmt, pointer, access_size, if_null, inv, size);
+  }
+  if (precision && !precision->ub().is_max()) {
+    // A precision can prove a bounded read safe even if the pointer offset is
+    // not a singleton. A terminator can stop the read before that upper bound.
+    auto state = inv;
+    this->init_global_ptr(state, pointer);
+    const auto& ptr = this->_lit_factory.get_scalar(pointer);
+    if (ptr.is_pointer_var() && !state.is_normal_flow_bottom()) {
+      auto offset = state.normal().pointer_offset_to_interval(ptr.var());
+      if (!offset.is_bottom() &&
+          precision->ub() <=
+              MachineInt::max(offset.bit_width(), Unsigned) - offset.ub()) {
+        auto lower = MachineInt(precision->lb().is_zero() ? 0 : 1,
+                                this->_size_type->bit_width(),
+                                Unsigned);
+        auto access_size = ar::IntegerConstant::get(this->_ar_context,
+                                                    this->_size_type,
+                                                    precision->ub());
+        return this->check_mem_access(stmt,
+                                      pointer,
+                                      access_size,
+                                      if_null,
+                                      inv,
+                                      IntInterval(lower, precision->ub()));
+      }
+    }
+  }
+  auto check =
+      this->check_mem_access(stmt, pointer, this->_size_one, if_null, inv);
+  if (check.kind == CheckKind::BufferOverflow && check.result == Result::Ok) {
+    // First-byte accessibility does not establish the presence of a terminator.
+    if (auto msg = this->display_mem_access_check(Result::Warning,
+                                                  stmt,
+                                                  pointer,
+                                                  this->_size_one)) {
+      *msg << ": could not establish a terminating NUL within the object\n";
+    }
+    return {CheckKind::UnknownMemoryAccess, Result::Warning, {pointer}, {}};
+  }
+  return check;
+}
+
+std::vector< BufferOverflowChecker::CheckResult > BufferOverflowChecker::
+    check_printf_arguments(ar::CallBase* call,
+                           unsigned format_index,
+                           const value::AbstractDomain& inv) {
+  auto format = call->argument(format_index);
+  std::vector< CheckResult > checks = {
+      this->check_string_read(call, format, Result::Error, inv)};
+  boost::optional< std::string > text;
+  this->string_read_size(format, boost::none, inv, &text);
+  auto fallback = [&]() {
+    // An unknown or unsupported format cannot identify the variadic reads.
+    // Check pointer validity, but do not assume that an unidentified pointer
+    // argument cannot be an unbounded string read.
+    for (unsigned i = format_index + 1; i < call->num_arguments(); ++i) {
+      auto arg = call->argument(i);
+      if (arg->type()->is_pointer()) {
+        auto check = this->check_string_access(call, arg, Result::Ok, inv);
+        if (check.kind == CheckKind::BufferOverflow &&
+            check.result == Result::Ok) {
+          check = {CheckKind::UnknownMemoryAccess, Result::Warning, {arg}, {}};
+        }
+        checks.push_back(std::move(check));
+      }
+    }
+    return checks;
+  };
+  if (!text) {
+    return fallback();
+  }
+  struct Argument {
+    unsigned index;
+    bool narrow_string;
+    boost::optional< IntInterval > precision;
+  };
+  std::vector< Argument > arguments;
+  unsigned next = format_index + 1;
+  std::size_t pos = 0;
+  bool valid = true;
+  auto digit = [](char c) { return c >= '0' && c <= '9'; };
+  auto number = [&]() {
+    unsigned n = 0;
+    while (pos < text->size() && digit((*text)[pos])) {
+      unsigned d = static_cast< unsigned >((*text)[pos++] - '0');
+      if (n > (std::numeric_limits< unsigned >::max() - d) / 10) {
+        valid = false;
+      } else {
+        n = n * 10 + d;
+      }
+    }
+    return n;
+  };
+  auto position = [&]() -> boost::optional< unsigned > {
+    auto saved = pos;
+    auto n = number();
+    if (pos < text->size() && (*text)[pos] == '$') {
+      ++pos;
+      if (!n || n > call->num_arguments() - format_index - 1) {
+        valid = false;
+        return boost::none;
+      }
+      return format_index + n;
+    }
+    pos = saved;
+    return boost::none;
+  };
+  auto star_precision = [&](unsigned i) -> boost::optional< IntInterval > {
+    if (i >= call->num_arguments()) {
+      valid = false;
+      return boost::none;
+    }
+    auto arg = this->_lit_factory.get_scalar(call->argument(i));
+    auto interval = IntInterval::top(32, Signed);
+    if (arg.is_machine_int()) {
+      interval = IntInterval(arg.machine_int());
+    } else if (arg.is_machine_int_var()) {
+      interval = inv.normal().int_to_interval(arg.var());
+    } else {
+      valid = false;
+      return boost::none;
+    }
+    if (interval.is_bottom() || interval.ub().is_negative()) {
+      return boost::none; // A negative precision is omitted.
+    }
+    auto width = this->_size_type->bit_width();
+    if (interval.lb().is_negative()) {
+      return IntInterval::top(width, Unsigned);
+    }
+    return IntInterval(interval.lb().cast(width, Unsigned),
+                       interval.ub().cast(width, Unsigned));
+  };
+  while (valid && pos < text->size()) {
+    if ((*text)[pos++] != '%') {
+      continue;
+    }
+    if (pos < text->size() && (*text)[pos] == '%') {
+      ++pos;
+      continue;
+    }
+    auto explicit_index = position();
+    while (pos < text->size() &&
+           std::string("-+ #0'").find((*text)[pos]) != std::string::npos) {
+      ++pos;
+    }
+    if (pos < text->size() && (*text)[pos] == '*') {
+      ++pos;
+      auto width_index = position();
+      if (!width_index) {
+        ++next;
+      }
+    } else {
+      number();
+    }
+    boost::optional< IntInterval > precision;
+    if (pos < text->size() && (*text)[pos] == '.') {
+      ++pos;
+      if (pos < text->size() && (*text)[pos] == '*') {
+        ++pos;
+        auto index = position();
+        unsigned precision_index = index ? *index : next++;
+        precision = star_precision(precision_index);
+      } else {
+        auto n = number();
+        precision =
+            IntInterval(MachineInt(n, this->_size_type->bit_width(), Unsigned));
+      }
+    }
+    bool wide = false;
+    if (pos < text->size() &&
+        std::string("hljztL").find((*text)[pos]) != std::string::npos) {
+      char length = (*text)[pos++];
+      wide = length == 'l';
+      if (pos < text->size() && (length == 'h' || length == 'l') &&
+          (*text)[pos] == length) {
+        ++pos;
+      }
+    }
+    if (!valid || pos == text->size()) {
+      return fallback();
+    }
+    char conversion = (*text)[pos++];
+    unsigned arg_index = explicit_index ? *explicit_index : next++;
+    if (std::string("diouxXfFeEgGaAcspn").find(conversion) ==
+            std::string::npos ||
+        arg_index >= call->num_arguments()) {
+      return fallback();
+    }
+    if (conversion == 's' || conversion == 'n') {
+      if (!call->argument(arg_index)->type()->is_pointer()) {
+        return fallback();
+      }
+      arguments.push_back({arg_index, conversion == 's' && !wide, precision});
+    }
+    // %p prints an address; it never reads the pointed-to bytes.
+  }
+  if (!valid) {
+    return fallback();
+  }
+  for (const auto& arg : arguments) {
+    auto pointer = call->argument(arg.index);
+    checks.push_back(
+        arg.narrow_string
+            ? this->check_string_read(call,
+                                      pointer,
+                                      Result::Ok,
+                                      inv,
+                                      arg.precision)
+            : this->check_string_access(call, pointer, Result::Ok, inv));
+  }
+  return checks;
 }
 
 BufferOverflowChecker::CheckResult BufferOverflowChecker::check_string_access(

@@ -47,6 +47,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <string>
+#include <vector>
+
 #include <ikos/ar/semantic/intrinsic.hpp>
 #include <ikos/ar/verify/type.hpp>
 
@@ -2832,12 +2836,16 @@ private:
         // must not remove the null return path.
         auto nullity = this->_inv.normal().nullity_to_nullity(lhs.var());
         this->_inv.normal().nullity_set(lhs.var(), Nullity::non_null());
-        // A wider cell gets an unknown initialized integer value: only
-        // initializedness, rather than the numerical zero, is required here.
+        // Record initialized storage, then zero its cells and materialize
+        // a bounded prefix of byte cells for later character reads.
         this->_inv.normal().mem_write(lhs.var(),
                                       ScalarLit::machine_int(
                                           MachineInt::zero(8, Unsigned)),
                                       initialized_size);
+        this->_inv.normal().mem_set(lhs.var(),
+                                    ScalarLit::machine_int(
+                                        MachineInt::zero(8, Unsigned)),
+                                    ScalarLit::machine_int(initialized_size));
         this->_inv.normal().nullity_set(lhs.var(), nullity);
       }
     }
@@ -3257,6 +3265,220 @@ private:
     }
   }
 
+  /// \brief Integer information for a scalar library operand.
+  IntInterval scalar_int_interval(const ScalarLit& value) const {
+    if (value.is_machine_int()) {
+      return IntInterval(value.machine_int());
+    }
+    ikos_assert(value.is_machine_int_var());
+    return this->_inv.normal().int_to_interval(value.var());
+  }
+
+  /// \brief Read known narrow bytes in a copy of the state. The returned
+  /// contents exclude the terminator; bounded reads need not reach a
+  /// terminator.
+  boost::optional< std::string > known_string_bytes(Variable* pointer,
+                                                    unsigned count,
+                                                    bool require_terminator) {
+    auto state = this->_inv;
+    auto width = this->_data_layout.pointers.bit_width;
+    auto offset = state.normal().pointer_offset_to_interval(pointer);
+    if (offset.is_bottom() ||
+        offset.ub().to_z_number() + count >
+            MachineInt::max(width, Unsigned).to_z_number()) {
+      return boost::none;
+    }
+    auto& ctx = this->_ctx.bundle->context();
+    auto byte_ty = ar::IntegerType::get(ctx, 8, Signed);
+    auto ptr_ty = ar::PointerType::get(ctx, byte_ty);
+    auto scan =
+        this->_var_factory.get_named_shadow(ptr_ty, "shadow.libc.read.ptr");
+    auto byte =
+        this->_var_factory.get_named_shadow(byte_ty, "shadow.libc.read.byte");
+    std::string bytes;
+    for (unsigned i = 0; i < count; ++i) {
+      state.normal().pointer_assign(scan,
+                                    pointer,
+                                    MachineInt(i, width, Unsigned));
+      state.normal().mem_read(ScalarLit::machine_int_var(byte),
+                              scan,
+                              MachineInt(1, width, Unsigned));
+      if (state.is_normal_flow_bottom() ||
+          !state.normal().uninit_is_initialized(byte)) {
+        return boost::none;
+      }
+      auto value = state.normal().int_to_interval(byte).singleton();
+      if (!value) {
+        return boost::none;
+      }
+      if (value->is_zero()) {
+        return bytes;
+      }
+      bytes.push_back(static_cast< char >(value->template to< int >()));
+    }
+    return require_terminator ? boost::optional< std::string >() : bytes;
+  }
+
+  /// \brief Write exactly the bytes produced by a supported library operation.
+  void write_string_bytes(Variable* pointer, const std::string& bytes) {
+    auto& ctx = this->_ctx.bundle->context();
+    auto byte_ty = ar::IntegerType::get(ctx, 8, Unsigned);
+    auto ptr_ty = ar::PointerType::get(ctx, byte_ty);
+    auto scan =
+        this->_var_factory.get_named_shadow(ptr_ty, "shadow.libc.write.ptr");
+    auto width = this->_data_layout.pointers.bit_width;
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+      this->_inv.normal().pointer_assign(scan,
+                                         pointer,
+                                         MachineInt(i, width, Unsigned));
+      this->_inv.normal()
+          .mem_write(scan,
+                     ScalarLit::machine_int(
+                         MachineInt(static_cast< unsigned >(
+                                        static_cast< unsigned char >(bytes[i])),
+                                    8,
+                                    Unsigned)),
+                     MachineInt(1, width, Unsigned));
+    }
+  }
+
+  /// \brief Evaluate literal text, %% and narrow %s with known width/precision.
+  /// Never invent a fixed terminator for an unknown output length or an
+  /// unsupported conversion (for example, wide character encoding failures).
+  boost::optional< std::string > known_printf_output(ar::CallBase* call,
+                                                     unsigned format_index) {
+    const auto& fmt =
+        this->_lit_factory.get_scalar(call->argument(format_index));
+    if (!fmt.is_pointer_var()) {
+      return boost::none;
+    }
+    auto format = this->known_string_bytes(fmt.var(), 4096, true);
+    if (!format) {
+      return boost::none;
+    }
+    std::string output;
+    unsigned arg_index = format_index + 1;
+    std::size_t pos = 0;
+    auto number = [&]() -> boost::optional< unsigned > {
+      unsigned n = 0;
+      while (pos < format->size() && (*format)[pos] >= '0' &&
+             (*format)[pos] <= '9') {
+        n = n * 10 + static_cast< unsigned >((*format)[pos++] - '0');
+        if (n > 4096) {
+          return boost::none;
+        }
+      }
+      return n;
+    };
+    auto star = [&]() -> boost::optional< int > {
+      if (arg_index >= call->num_arguments()) {
+        return boost::none;
+      }
+      const auto& arg =
+          this->_lit_factory.get_scalar(call->argument(arg_index++));
+      if (!arg.is_machine_int() && !arg.is_machine_int_var()) {
+        return boost::none;
+      }
+      auto value = this->scalar_int_interval(arg).singleton();
+      if (!value || value->to_z_number() < -4096 ||
+          value->to_z_number() > 4096) {
+        return boost::none;
+      }
+      return value->template to< int >();
+    };
+    while (pos < format->size()) {
+      char c = (*format)[pos++];
+      if (c != '%') {
+        output.push_back(c);
+      } else if (pos < format->size() && (*format)[pos] == '%') {
+        ++pos;
+        output.push_back('%');
+      } else {
+        // v3.5.19: only the '-' flag is modelled. Other flags ('0', '+',
+        // ' ', '#', '\'') change the output (e.g. "%05s" is undefined and
+        // pads with '0' on some libc): use the generic model instead. A '0'
+        // here would otherwise be read as part of the width.
+        bool left = false;
+        while (pos < format->size()) {
+          char flag = (*format)[pos];
+          if (flag == '-') {
+            left = true;
+            ++pos;
+          } else if (flag == '0' || flag == '+' || flag == ' ' ||
+                     flag == '#' || flag == '\'') {
+            return boost::none;
+          } else {
+            break;
+          }
+        }
+        unsigned width = 0;
+        if (pos < format->size() && (*format)[pos] == '*') {
+          ++pos;
+          auto n = star();
+          if (!n) {
+            return boost::none;
+          }
+          if (*n < 0) {
+            left = true;
+          }
+          width = static_cast< unsigned >(*n < 0 ? -*n : *n);
+        } else {
+          auto n = number();
+          if (!n) {
+            return boost::none;
+          }
+          width = *n;
+        }
+        boost::optional< unsigned > precision;
+        if (pos < format->size() && (*format)[pos] == '.') {
+          ++pos;
+          if (pos < format->size() && (*format)[pos] == '*') {
+            ++pos;
+            auto n = star();
+            if (!n) {
+              return boost::none;
+            }
+            if (*n >= 0) {
+              precision = static_cast< unsigned >(*n);
+            }
+          } else {
+            precision = number();
+            if (!precision) {
+              return boost::none;
+            }
+          }
+        }
+        if (pos == format->size() || (*format)[pos++] != 's' ||
+            arg_index >= call->num_arguments()) {
+          return boost::none;
+        }
+        const auto& arg =
+            this->_lit_factory.get_scalar(call->argument(arg_index++));
+        if (!arg.is_pointer_var()) {
+          return boost::none;
+        }
+        auto bytes = this->known_string_bytes(arg.var(),
+                                              precision ? *precision : 4096,
+                                              !precision);
+        if (!bytes) {
+          return boost::none;
+        }
+        auto padding = width > bytes->size() ? width - bytes->size() : 0;
+        if (!left) {
+          output.append(padding, ' ');
+        }
+        output += *bytes;
+        if (left) {
+          output.append(padding, ' ');
+        }
+      }
+      if (output.size() > 4096) {
+        return boost::none;
+      }
+    }
+    return output;
+  }
+
   /// \brief Execute a call to libc sprintf
   ///
   /// #include <stdio.h>
@@ -3304,11 +3526,39 @@ private:
   /// the terminating `\0'); if the return value is greater than or equal to the
   /// size argument, the string was too short and some of the printed characters
   /// were discarded.  The output is always null-terminated, unless size is 0.
-  void exec_snprintf(ar::CallBase* call) {
+  void exec_snprintf(ar::CallBase* call, unsigned format_index = 2) {
     this->init_global_operands(call);
 
     const ScalarLit& ptr = this->_lit_factory.get_scalar(call->argument(0));
     const ScalarLit& size = this->_lit_factory.get_scalar(call->argument(1));
+
+    // Evaluate supported, fully known narrow formats before forgetting the
+    // destination. Unsupported formats keep the conservative existing model.
+    auto output = this->known_printf_output(call, format_index);
+    auto size_interval = this->scalar_int_interval(size);
+    auto n = size_interval.singleton();
+    if (output && n && n->to_z_number() <= 4096) {
+      auto length = output->size();
+      if (!n->is_zero()) {
+        if (!this->prepare_mem_access(ptr)) {
+          return;
+        }
+        output->resize(
+            std::min(output->size(), n->template to< std::size_t >() - 1));
+        output->push_back('\0');
+        this->write_string_bytes(ptr.var(), *output);
+      }
+      // Return the untruncated length, excluding the terminator.
+      if (call->has_result()) {
+        const auto& lhs = this->_lit_factory.get_scalar(call->result());
+        auto ty = cast< ar::IntegerType >(call->result()->type());
+        this->_inv.normal().int_assign(lhs.var(),
+                                       MachineInt(length,
+                                                  ty->bit_width(),
+                                                  ty->sign()));
+      }
+      return;
+    }
 
     // Calling snprintf with zero bufsz and null pointer buffer can be used to
     // determine the buffer size needed to contain the output. That case is
@@ -3588,7 +3838,11 @@ private:
       return;
     }
 
-    if (this->_inv.normal().pointer_to_points_to(dest.var()).is_top()) {
+    auto bytes = this->known_string_bytes(src.var(), 4096, true);
+    if (bytes) {
+      bytes->push_back('\0');
+      this->write_string_bytes(dest.var(), *bytes);
+    } else if (this->_inv.normal().pointer_to_points_to(dest.var()).is_top()) {
       // Ignore strcpy, analysis could be unsound.
       // See CheckKind::IgnoredCallSideEffectOnPointerParameter
     } else {
@@ -3628,7 +3882,17 @@ private:
       return;
     }
 
-    if (this->_inv.normal().pointer_to_points_to(dest.var()).is_top()) {
+    auto count = this->scalar_int_interval(size).singleton();
+    boost::optional< std::string > bytes;
+    if (count && count->to_z_number() <= 4096) {
+      bytes = this->known_string_bytes(src.var(),
+                                       count->template to< unsigned >(),
+                                       false);
+    }
+    if (bytes) {
+      bytes->resize(count->template to< std::size_t >(), '\0');
+      this->write_string_bytes(dest.var(), *bytes);
+    } else if (this->_inv.normal().pointer_to_points_to(dest.var()).is_top()) {
       // Ignore strncpy, analysis could be unsound.
       // See CheckKind::IgnoredCallSideEffectOnPointerParameter
     } else if (size.is_machine_int()) {
