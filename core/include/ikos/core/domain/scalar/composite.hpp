@@ -125,6 +125,7 @@ public:
 private:
   using PointsToMap = SeparateDomain< VariableRef, PointsToSetT >;
   using FloatZeroMap = SeparateDomain< VariableRef, FloatZero >;
+  using PointerOffsetMap = SeparateDomain< VariableRef, numeric::ZInterval >;
   using IntVariableTrait = machine_int::VariableTraits< VariableRef >;
   using ScalarVariableTrait = scalar::VariableTraits< VariableRef >;
 
@@ -143,18 +144,26 @@ private:
 
   FloatZeroMap _float_zero;
 
+  // Integer bit representations of pointers. A finite/one-sided offset fact
+  // records an intact encoding; missing (TOP) means no pointer origin is known.
+  // Nullity and points-to snapshots use the same variable in the maps above.
+  // Snapshot offsets instead of referring to a mutable source pointer variable.
+  PointerOffsetMap _int_pointer_offsets;
+
 private:
   /// \brief Constructor
   CompositeDomain(UninitializedDomain uninitialized,
                   MachineIntDomain integer,
                   NullityDomain nullity,
                   PointsToMap points_to_map,
-                  FloatZeroMap float_zero)
+                  FloatZeroMap float_zero,
+                  PointerOffsetMap int_pointer_offsets)
       : _uninitialized(std::move(uninitialized)),
         _integer(std::move(integer)),
         _nullity(std::move(nullity)),
         _points_to_map(std::move(points_to_map)),
-        _float_zero(std::move(float_zero)) {
+        _float_zero(std::move(float_zero)),
+        _int_pointer_offsets(std::move(int_pointer_offsets)) {
     this->normalize();
   }
 
@@ -171,7 +180,8 @@ public:
         _integer(std::move(integer)),
         _nullity(std::move(nullity)),
         _points_to_map(PointsToMap::top()),
-        _float_zero(FloatZeroMap::top()) {
+        _float_zero(FloatZeroMap::top()),
+        _int_pointer_offsets(PointerOffsetMap::top()) {
     this->normalize();
   }
 
@@ -218,6 +228,12 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.normalize();
+    if (this->_int_pointer_offsets.is_bottom()) {
+      this->set_to_bottom();
+      return;
+    }
+
     this->_float_zero.normalize();
     if (this->_float_zero.is_bottom()) {
       this->set_to_bottom();
@@ -243,17 +259,36 @@ private:
   /// This is not always correct since it doesn't check this->_integer
   bool is_bottom_fast() const { return this->_uninitialized.is_bottom(); }
 
+  void forget_integer_pointer(VariableRef x) {
+    this->_int_pointer_offsets.forget(x);
+    this->_nullity.forget(x);
+    this->_points_to_map.forget(x);
+  }
+
+  void copy_integer_pointer(VariableRef x, VariableRef y) {
+    auto offsets = this->_int_pointer_offsets.get(y);
+    if (IntVariableTrait::bit_width(x) != IntVariableTrait::bit_width(y) ||
+        offsets.is_top()) {
+      this->forget_integer_pointer(x);
+    } else {
+      this->_int_pointer_offsets.set(x, offsets);
+      this->_nullity.assign(x, y);
+      this->_points_to_map.set(x, this->_points_to_map.get(y));
+    }
+  }
+
 public:
   bool is_bottom() const override {
     return this->_uninitialized.is_bottom() || this->_nullity.is_bottom() ||
            this->_points_to_map.is_bottom() || this->_integer.is_bottom() ||
-           this->_float_zero.is_bottom();
+           this->_float_zero.is_bottom() ||
+           this->_int_pointer_offsets.is_bottom();
   }
 
   bool is_top() const override {
     return this->_uninitialized.is_top() && this->_nullity.is_top() &&
            this->_points_to_map.is_top() && this->_integer.is_top() &&
-           this->_float_zero.is_top();
+           this->_float_zero.is_top() && this->_int_pointer_offsets.is_top();
   }
 
   void set_to_bottom() override {
@@ -262,6 +297,7 @@ public:
     this->_nullity.set_to_bottom();
     this->_points_to_map.set_to_bottom();
     this->_float_zero.set_to_bottom();
+    this->_int_pointer_offsets.set_to_bottom();
   }
 
   void set_to_top() override {
@@ -270,6 +306,7 @@ public:
     this->_nullity.set_to_top();
     this->_points_to_map.set_to_top();
     this->_float_zero.set_to_top();
+    this->_int_pointer_offsets.set_to_top();
   }
 
   bool leq(const CompositeDomain& other) const override {
@@ -282,7 +319,8 @@ public:
              this->_integer.leq(other._integer) &&
              this->_nullity.leq(other._nullity) &&
              this->_points_to_map.leq(other._points_to_map) &&
-             this->_float_zero.leq(other._float_zero);
+             this->_float_zero.leq(other._float_zero) &&
+             this->_int_pointer_offsets.leq(other._int_pointer_offsets);
     }
   }
 
@@ -296,7 +334,8 @@ public:
              this->_integer.equals(other._integer) &&
              this->_nullity.equals(other._nullity) &&
              this->_points_to_map.equals(other._points_to_map) &&
-             this->_float_zero.equals(other._float_zero);
+             this->_float_zero.equals(other._float_zero) &&
+             this->_int_pointer_offsets.equals(other._int_pointer_offsets);
     }
   }
 
@@ -313,6 +352,8 @@ public:
       this->_nullity.join_with(std::move(other._nullity));
       this->_points_to_map.join_with(std::move(other._points_to_map));
       this->_float_zero.join_with(std::move(other._float_zero));
+      this->_int_pointer_offsets.join_with(
+          std::move(other._int_pointer_offsets));
     }
   }
 
@@ -328,6 +369,7 @@ public:
       this->_nullity.join_with(other._nullity);
       this->_points_to_map.join_with(other._points_to_map);
       this->_float_zero.join_with(other._float_zero);
+      this->_int_pointer_offsets.join_with(other._int_pointer_offsets);
     }
   }
 
@@ -344,6 +386,8 @@ public:
       this->_nullity.join_loop_with(std::move(other._nullity));
       this->_points_to_map.join_loop_with(std::move(other._points_to_map));
       this->_float_zero.join_loop_with(std::move(other._float_zero));
+      this->_int_pointer_offsets.join_loop_with(
+          std::move(other._int_pointer_offsets));
     }
   }
 
@@ -359,6 +403,7 @@ public:
       this->_nullity.join_loop_with(other._nullity);
       this->_points_to_map.join_loop_with(other._points_to_map);
       this->_float_zero.join_loop_with(other._float_zero);
+      this->_int_pointer_offsets.join_loop_with(other._int_pointer_offsets);
     }
   }
 
@@ -375,6 +420,8 @@ public:
       this->_nullity.join_iter_with(std::move(other._nullity));
       this->_points_to_map.join_iter_with(std::move(other._points_to_map));
       this->_float_zero.join_iter_with(std::move(other._float_zero));
+      this->_int_pointer_offsets.join_iter_with(
+          std::move(other._int_pointer_offsets));
     }
   }
 
@@ -390,6 +437,7 @@ public:
       this->_nullity.join_iter_with(other._nullity);
       this->_points_to_map.join_iter_with(other._points_to_map);
       this->_float_zero.join_iter_with(other._float_zero);
+      this->_int_pointer_offsets.join_iter_with(other._int_pointer_offsets);
     }
   }
 
@@ -405,6 +453,7 @@ public:
       this->_nullity.widen_with(other._nullity);
       this->_points_to_map.widen_with(other._points_to_map);
       this->_float_zero.widen_with(other._float_zero);
+      this->_int_pointer_offsets.widen_with(other._int_pointer_offsets);
     }
   }
 
@@ -421,6 +470,7 @@ public:
       this->_nullity.widen_with(other._nullity);
       this->_points_to_map.widen_with(other._points_to_map);
       this->_float_zero.widen_with(other._float_zero);
+      this->_int_pointer_offsets.widen_with(other._int_pointer_offsets);
     }
   }
 
@@ -436,6 +486,7 @@ public:
       this->_nullity.meet_with(other._nullity);
       this->_points_to_map.meet_with(other._points_to_map);
       this->_float_zero.meet_with(other._float_zero);
+      this->_int_pointer_offsets.meet_with(other._int_pointer_offsets);
     }
   }
 
@@ -451,6 +502,7 @@ public:
       this->_nullity.narrow_with(other._nullity);
       this->_points_to_map.narrow_with(other._points_to_map);
       this->_float_zero.narrow_with(other._float_zero);
+      this->_int_pointer_offsets.narrow_with(other._int_pointer_offsets);
     }
   }
 
@@ -467,6 +519,7 @@ public:
       this->_nullity.narrow_with(other._nullity);
       this->_points_to_map.narrow_with(other._points_to_map);
       this->_float_zero.narrow_with(other._float_zero);
+      this->_int_pointer_offsets.narrow_with(other._int_pointer_offsets);
     }
   }
 
@@ -480,7 +533,9 @@ public:
                              this->_integer.join(other._integer),
                              this->_nullity.join(other._nullity),
                              this->_points_to_map.join(other._points_to_map),
-                             this->_float_zero.join(other._float_zero));
+                             this->_float_zero.join(other._float_zero),
+                             this->_int_pointer_offsets.join(
+                                 other._int_pointer_offsets));
     }
   }
 
@@ -496,7 +551,9 @@ public:
                              this->_nullity.join_loop(other._nullity),
                              this->_points_to_map.join_loop(
                                  other._points_to_map),
-                             this->_float_zero.join_loop(other._float_zero));
+                             this->_float_zero.join_loop(other._float_zero),
+                             this->_int_pointer_offsets.join_loop(
+                                 other._int_pointer_offsets));
     }
   }
 
@@ -512,7 +569,9 @@ public:
                              this->_nullity.join_iter(other._nullity),
                              this->_points_to_map.join_iter(
                                  other._points_to_map),
-                             this->_float_zero.join_iter(other._float_zero));
+                             this->_float_zero.join_iter(other._float_zero),
+                             this->_int_pointer_offsets.join_iter(
+                                 other._int_pointer_offsets));
     }
   }
 
@@ -528,7 +587,9 @@ public:
                              this->_nullity.widening(other._nullity),
                              this->_points_to_map.widening(
                                  other._points_to_map),
-                             this->_float_zero.widening(other._float_zero));
+                             this->_float_zero.widening(other._float_zero),
+                             this->_int_pointer_offsets.widening(
+                                 other._int_pointer_offsets));
     }
   }
 
@@ -547,7 +608,9 @@ public:
                              this->_nullity.widening(other._nullity),
                              this->_points_to_map.widening(
                                  other._points_to_map),
-                             this->_float_zero.widening(other._float_zero));
+                             this->_float_zero.widening(other._float_zero),
+                             this->_int_pointer_offsets.widening(
+                                 other._int_pointer_offsets));
     }
   }
 
@@ -561,7 +624,9 @@ public:
                              this->_integer.meet(other._integer),
                              this->_nullity.meet(other._nullity),
                              this->_points_to_map.meet(other._points_to_map),
-                             this->_float_zero.meet(other._float_zero));
+                             this->_float_zero.meet(other._float_zero),
+                             this->_int_pointer_offsets.meet(
+                                 other._int_pointer_offsets));
     }
   }
 
@@ -577,7 +642,9 @@ public:
                              this->_nullity.narrowing(other._nullity),
                              this->_points_to_map.narrowing(
                                  other._points_to_map),
-                             this->_float_zero.narrowing(other._float_zero));
+                             this->_float_zero.narrowing(other._float_zero),
+                             this->_int_pointer_offsets.narrowing(
+                                 other._int_pointer_offsets));
     }
   }
 
@@ -596,7 +663,9 @@ public:
                              this->_nullity.narrowing(other._nullity),
                              this->_points_to_map.narrowing(
                                  other._points_to_map),
-                             this->_float_zero.narrowing(other._float_zero));
+                             this->_float_zero.narrowing(other._float_zero),
+                             this->_int_pointer_offsets.narrowing(
+                                 other._int_pointer_offsets));
     }
   }
 
@@ -635,6 +704,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.assign(x, n);
   }
@@ -646,6 +716,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assign_uninitialized(x);
     this->_integer.forget(x);
   }
@@ -657,6 +728,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
   }
@@ -669,6 +741,7 @@ public:
       return;
     }
 
+    this->copy_integer_pointer(x, y);
     this->_uninitialized.assign(x, y);
     this->_integer.assign(x, y);
   }
@@ -680,6 +753,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     for (const auto& term : e) {
       ikos_assert(ScalarVariableTrait::is_int(term.first));
       this->_uninitialized.assert_initialized(term.first);
@@ -702,6 +776,11 @@ public:
       return;
     }
 
+    if (op == IntUnaryOperator::SignCast) {
+      this->copy_integer_pointer(x, y);
+    } else {
+      this->forget_integer_pointer(x);
+    }
     this->_uninitialized.assert_initialized(y);
 
     if (this->_uninitialized.is_bottom()) {
@@ -737,6 +816,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assert_initialized(y);
     this->_uninitialized.assert_initialized(z);
 
@@ -767,6 +847,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.apply(op, x, y, z);
   }
@@ -789,6 +870,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.apply(op, x, y, z);
   }
@@ -853,6 +935,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.set(x, value);
   }
@@ -864,6 +947,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.set(x, value);
   }
@@ -875,6 +959,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.set(x, value);
   }
@@ -904,6 +989,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.forget(x);
     this->_integer.forget(x);
   }
@@ -959,18 +1045,21 @@ public:
   void counter_init(VariableRef x, const MachineInt& c) override {
     ikos_assert(ScalarVariableTrait::is_int(x));
 
+    this->forget_integer_pointer(x);
     this->_integer.counter_init(x, c);
   }
 
   void counter_incr(VariableRef x, const MachineInt& k) override {
     ikos_assert(ScalarVariableTrait::is_int(x));
 
+    this->forget_integer_pointer(x);
     this->_integer.counter_incr(x, k);
   }
 
   void counter_forget(VariableRef x) override {
     ikos_assert(ScalarVariableTrait::is_int(x));
 
+    this->forget_integer_pointer(x);
     this->_integer.counter_forget(x);
   }
 
@@ -1446,6 +1535,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assert_initialized(p);
 
     if (this->_uninitialized.is_bottom()) {
@@ -1534,6 +1624,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.set(x, this->_int_pointer_offsets.get(y));
     this->_float_zero.set(x, this->_float_zero.get(y));
     this->_uninitialized.assign(x, y);
     if (IntVariableTrait::sign(x) == IntVariableTrait::sign(y)) {
@@ -1554,6 +1645,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.assign_uninitialized(x);
     this->_integer.forget(x);
@@ -1569,6 +1661,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
@@ -1585,6 +1678,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     if (IntVariableTrait::sign(x) == n.sign()) {
@@ -1604,6 +1698,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
@@ -1622,6 +1717,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.assign(x, y);
     if (IntVariableTrait::sign(x) == IntVariableTrait::sign(y)) {
@@ -1629,9 +1725,19 @@ public:
     } else {
       this->_integer.apply(IntUnaryOperator::SignCast, x, y);
     }
-    this->_nullity.forget(x);
-    this->_points_to_map.forget(x);
-    this->_integer.forget(ScalarVariableTrait::offset_var(x));
+    this->copy_integer_pointer(x, y);
+    auto offsets = this->_int_pointer_offsets.get(x);
+    auto offset = ScalarVariableTrait::offset_var(x);
+    if (offsets.is_top()) {
+      this->_integer.forget(offset);
+    } else {
+      this->_integer
+          .set(offset,
+               IntInterval::from_z_interval(offsets,
+                                            IntVariableTrait::bit_width(offset),
+                                            IntVariableTrait::sign(offset),
+                                            IntInterval::WrapTag{}));
+    }
   }
 
   void dynamic_write_nondet_float(VariableRef x) override {
@@ -1641,6 +1747,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
@@ -1656,6 +1763,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
@@ -1676,6 +1784,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
@@ -1695,6 +1804,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.assign(x, y);
     this->_integer.forget(x);
@@ -1715,6 +1825,18 @@ public:
     }
 
     this->_float_zero.forget(x);
+    this->copy_integer_pointer(x, y);
+    if (this->_int_pointer_offsets.get(x).is_top() &&
+        (!this->_points_to_map.get(y).is_top() ||
+         !this->_nullity.get(y).is_top())) {
+      this->_int_pointer_offsets.set(x,
+                                     this->_integer
+                                         .to_interval(
+                                             ScalarVariableTrait::offset_var(y))
+                                         .to_z_interval());
+      this->_nullity.assign(x, y);
+      this->_points_to_map.set(x, this->_points_to_map.get(y));
+    }
     this->_uninitialized.assign(x, y);
     if (IntVariableTrait::sign(x) == IntVariableTrait::sign(y)) {
       this->_integer.assign(x, y);
@@ -1759,6 +1881,7 @@ public:
       return;
     }
 
+    this->_int_pointer_offsets.forget(x);
     this->_float_zero.forget(x);
     this->_uninitialized.forget(x);
     this->_integer.forget(x);
@@ -1803,6 +1926,39 @@ public:
     }
   }
 
+  boost::optional< PointerAbsValueT > scalar_pointer_origin(
+      VariableRef x) const override {
+    ikos_assert(ScalarVariableTrait::is_int(x) ||
+                ScalarVariableTrait::is_dynamic(x));
+    auto offsets = this->_int_pointer_offsets.get(x);
+    if (offsets.is_top()) {
+      // Pointer-typed memory cells also carry an intact representation, even
+      // before an ABI integer load has captured an integer encoding for it.
+      if (!ScalarVariableTrait::is_dynamic(x) ||
+          (this->_points_to_map.get(x).is_top() &&
+           this->_nullity.get(x).is_top())) {
+        return boost::none;
+      }
+      offsets = this->_integer.to_interval(ScalarVariableTrait::offset_var(x))
+                    .to_z_interval();
+    }
+    if (this->is_bottom()) {
+      return boost::none;
+    }
+    auto bits =
+        ScalarVariableTrait::is_dynamic(x)
+            ? IntVariableTrait::bit_width(ScalarVariableTrait::offset_var(x))
+            : IntVariableTrait::bit_width(x);
+    return PointerAbsValueT(this->_uninitialized.get(x),
+                            this->_nullity.get(x),
+                            this->_points_to_map.get(x),
+                            IntInterval::
+                                from_z_interval(offsets,
+                                                bits,
+                                                Unsigned,
+                                                IntInterval::WrapTag{}));
+  }
+
   void scalar_pointer_to_int(VariableRef x,
                              VariableRef p,
                              MemoryLocationRef absolute_zero) override {
@@ -1824,6 +1980,7 @@ public:
       return;
     }
 
+    this->forget_integer_pointer(x);
     this->_uninitialized.assign_initialized(x);
     if (this->_nullity.is_null(p)) {
       auto zero = MachineInt::zero(IntVariableTrait::bit_width(x),
@@ -1839,6 +1996,13 @@ public:
     } else {
       this->_integer.forget(x);
     }
+    this->_int_pointer_offsets.set(x,
+                                   this->_integer
+                                       .to_interval(
+                                           ScalarVariableTrait::offset_var(p))
+                                       .to_z_interval());
+    this->_nullity.assign(x, p);
+    this->_points_to_map.set(x, this->_points_to_map.get(p));
   }
 
   void scalar_int_to_pointer(VariableRef p,
@@ -1859,6 +2023,21 @@ public:
     this->normalize();
 
     if (this->is_bottom()) {
+      return;
+    }
+
+    auto offsets = this->_int_pointer_offsets.get(x);
+    if (!offsets.is_top()) {
+      this->_uninitialized.assign_initialized(p);
+      this->_nullity.assign(p, x);
+      this->_points_to_map.set(p, this->_points_to_map.get(x));
+      VariableRef offset = ScalarVariableTrait::offset_var(p);
+      this->_integer
+          .set(offset,
+               IntInterval::from_z_interval(offsets,
+                                            IntVariableTrait::bit_width(offset),
+                                            IntVariableTrait::sign(offset),
+                                            IntInterval::WrapTag{}));
       return;
     }
 
@@ -1919,6 +2098,8 @@ public:
       this->_points_to_map.dump(o);
       o << ", fp_zero=";
       this->_float_zero.dump(o);
+      o << ", encoded_ptr_offsets=";
+      this->_int_pointer_offsets.dump(o);
       o << ")";
     }
   }
