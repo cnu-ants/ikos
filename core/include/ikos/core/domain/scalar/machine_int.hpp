@@ -820,6 +820,12 @@ public:
     this->_uninitialized.assign(x, y);
   }
 
+  void float_set_zero(VariableRef, const FloatZero&) override {}
+
+  FloatZero float_to_zero(VariableRef) const override {
+    return this->is_bottom() ? FloatZero::bottom() : FloatZero::top();
+  }
+
   void float_forget(VariableRef x) override {
     ikos_assert(ScalarVariableTrait::is_float(x));
 

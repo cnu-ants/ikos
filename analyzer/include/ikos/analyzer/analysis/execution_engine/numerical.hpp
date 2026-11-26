@@ -48,7 +48,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <ikos/ar/semantic/intrinsic.hpp>
@@ -480,8 +484,9 @@ private:
 
     void machine_int(const MachineInt&) { ikos_unreachable("unreachable"); }
 
-    void floating_point(const DummyNumber&) {
+    void floating_point(const DummyNumber& value) {
       this->_inv.normal().float_assign_nondet(this->_lhs);
+      this->_inv.normal().float_set_zero(this->_lhs, value.zero);
     }
 
     void memory_location(MemoryLocation*) { ikos_unreachable("unreachable"); }
@@ -618,8 +623,9 @@ private:
 
     void machine_int(const MachineInt&) { ikos_unreachable("unreachable"); }
 
-    void floating_point(const DummyNumber&) {
+    void floating_point(const DummyNumber& value) {
       this->_inv.normal().float_assign_nondet(this->_lhs);
+      this->_inv.normal().float_set_zero(this->_lhs, value.zero);
     }
 
     void memory_location(MemoryLocation*) { ikos_unreachable("unreachable"); }
@@ -989,9 +995,11 @@ public:
       case ar::UnaryOperation::SExt: {
         this->exec_int_conv(IntUnaryOperator::Ext, lhs.scalar(), rhs.scalar());
       } break;
-      case ar::UnaryOperation::FPTrunc:
+      case ar::UnaryOperation::FPTrunc: {
+        this->exec_float_conv(lhs.scalar(), rhs.scalar(), /*widen=*/false);
+      } break;
       case ar::UnaryOperation::FPExt: {
-        this->exec_float_conv(lhs.scalar(), rhs.scalar());
+        this->exec_float_conv(lhs.scalar(), rhs.scalar(), /*widen=*/true);
       } break;
       case ar::UnaryOperation::FPToUI:
       case ar::UnaryOperation::FPToSI: {
@@ -1039,14 +1047,60 @@ private:
   }
 
   /// \brief Execute a floating point conversion
-  void exec_float_conv(const ScalarLit& lhs, const ScalarLit& rhs) {
+  void exec_float_conv(const ScalarLit& lhs, const ScalarLit& rhs, bool widen) {
     ikos_assert_msg(lhs.is_floating_point_var(),
                     "left hand side is not a floating point variable");
 
     if (rhs.is_floating_point_var()) {
       this->_inv.normal().uninit_assert_initialized(rhs.var());
     }
+    core::FloatZero source = this->float_zero_of(rhs);
     this->_inv.normal().float_assign_nondet(lhs.var());
+
+    // Propagate the zero classification (v3.5.11.1).
+    // - Widening (fpext) is exact: zero stays zero, and every nonzero value
+    //   stays nonzero (a subnormal input keeps the subnormal class, see
+    //   below).
+    // - Narrowing (fptrunc) only preserves zero: a tiny nonzero value can
+    //   round to zero or become subnormal.
+    uint64_t format = float_format(lhs.var()->type());
+    if (format == 0 || source.is_bottom() || source.is_top()) {
+      return;
+    }
+    if (source.is_zero()) {
+      this->_inv.normal().float_set_zero(lhs.var(), core::FloatZero::zero(format));
+    } else if (widen) {
+      // v3.5.19: under a non-IEEE denormal mode (e.g. preserve-sign), a
+      // subnormal input may be flushed to zero by the extension. Keep the
+      // subnormal class so that only an IEEE function treats it as nonzero.
+      auto value = core::FloatZero::other(format);
+      if (source.may_be_subnormal()) {
+        value.join_with(core::FloatZero::subnormal(format));
+      }
+      if (!source.is_non_zero()) {
+        value.join_with(core::FloatZero::zero(format));
+      }
+      this->_inv.normal().float_set_zero(lhs.var(), value);
+    }
+  }
+
+  /// \brief Return the floating point format tag of a floating type, or 0
+  static uint64_t float_format(ar::Type* type) {
+    auto fp = dyn_cast< ar::FloatType >(type);
+    if (fp == nullptr || fp->float_semantic() == ar::PPC_FP128) {
+      return 0;
+    }
+    return static_cast< uint64_t >(fp->float_semantic()) + 1;
+  }
+
+  /// \brief Return the zero classification of a floating point literal
+  core::FloatZero float_zero_of(const ScalarLit& lit) {
+    if (lit.is_floating_point()) {
+      return lit.floating_point().zero;
+    } else if (lit.is_floating_point_var()) {
+      return this->_inv.normal().float_to_zero(lit.var());
+    }
+    return core::FloatZero::top();
   }
 
   /// \brief Execute a conversion from floating point to integer
@@ -1068,7 +1122,32 @@ private:
     if (rhs.is_machine_int_var()) {
       this->_inv.normal().uninit_assert_initialized(rhs.var());
     }
+    IntInterval input = rhs.is_machine_int()
+                            ? IntInterval(rhs.machine_int())
+                            : (rhs.is_machine_int_var()
+                                   ? this->_inv.normal().int_to_interval(
+                                         rhs.var())
+                                   : IntInterval::bottom(1, Signed));
     this->_inv.normal().float_assign_nondet(lhs.var());
+
+    // An integer converts to zero iff it is zero, and never to a subnormal
+    // (v3.5.11.1).
+    uint64_t format = float_format(lhs.var()->type());
+    if (format == 0 || input.is_bottom() ||
+        !(rhs.is_machine_int() || rhs.is_machine_int_var())) {
+      return;
+    }
+    auto zero = MachineInt::zero(input.bit_width(), input.sign());
+    if (input.singleton() && input.singleton()->is_zero()) {
+      this->_inv.normal().float_set_zero(lhs.var(), core::FloatZero::zero(format));
+    } else if (!input.contains(zero)) {
+      this->_inv.normal().float_set_zero(lhs.var(),
+                                         core::FloatZero::other(format));
+    } else {
+      auto value = core::FloatZero::zero(format);
+      value.join_with(core::FloatZero::other(format));
+      this->_inv.normal().float_set_zero(lhs.var(), value);
+    }
   }
 
   /// \brief Execute a conversion from pointer to integer
@@ -1413,6 +1492,7 @@ public:
       case ar::Comparison::FULE:
       case ar::Comparison::FUNE: {
         this->exec_float_comparison(left, right);
+        this->refine_float_comparison(s);
       } break;
       case ar::Comparison::PEQ: {
         this->exec_ptr_comparison(PointerPredicate::EQ, left, right);
@@ -1463,6 +1543,112 @@ private:
       }
     } else {
       ikos_unreachable("unexpected left operand");
+    }
+  }
+
+  /// \brief Learn `x != 0.0` from a floating point comparison (v3.5.11.1)
+  ///
+  /// The comparison statement holds on this path. Against a constant c:
+  ///   x > c, c >= 0 | x >= c, c > 0 | x < c, c <= 0 | x <= c, c < 0
+  ///   x != c, c == 0 | x == c, c != 0
+  /// all exclude x == 0 (NaN is classified as nonzero). Unordered variants
+  /// also accept NaN, which is still nonzero.
+  void refine_float_comparison(ar::Comparison* s) {
+    if (this->_inv.is_normal_flow_bottom()) {
+      return;
+    }
+    ar::Value* var = s->left();
+    ar::Value* other = s->right();
+    bool swapped = false;
+    if (isa< ar::FloatConstant >(var) && !isa< ar::FloatConstant >(other)) {
+      std::swap(var, other);
+      swapped = true;
+    }
+    auto cst = dyn_cast< ar::FloatConstant >(other);
+    if (cst == nullptr || !isa< ar::InternalVariable >(var)) {
+      return;
+    }
+    const std::string& text = cst->value();
+    char* end = nullptr;
+    double c = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || *end != '\0' || std::isnan(c)) {
+      return; // unparsable, partially parsed or NaN
+    }
+    bool c_zero = std::fpclassify(c) == FP_ZERO;
+    bool underflow = false;
+    // v3.5.11.2: the rules below only use the sign of `c` and whether it is
+    // zero. A long double constant below the double range (e.g. -1e-4900L on
+    // x86_64) underflows to -0.0 in strtod, which would turn `x > c` into
+    // `x > 0`. A zero is only taken as zero if all its digits are 0;
+    // otherwise keep the written sign of the nonzero constant. (Overflow to
+    // an infinity keeps the sign as well.)
+    if (c_zero) {
+      for (char ch : text) {
+        if (ch == 'e' || ch == 'E') {
+          break;
+        }
+        if (ch >= '1' && ch <= '9') {
+          c = text[0] == '-' ? -1.0 : 1.0;
+          c_zero = false;
+          underflow = true;
+          break;
+        }
+      }
+    }
+    // v3.5.20: under a non-IEEE denormal mode (DAZ), a subnormal constant is
+    // read as 0: `x >= tiny` then also holds for x == 0. Rules that rely on c
+    // being nonzero are only used when c is a normal value of its format.
+    bool c_normal = !c_zero && !underflow;
+    if (c_normal) {
+      double magnitude = std::fabs(c);
+      switch (cst->type()->float_semantic()) {
+        case ar::Half:
+          c_normal = magnitude >= 6.103515625e-05;
+          break;
+        case ar::Float:
+          c_normal = magnitude >= static_cast< double >(FLT_MIN);
+          break;
+        case ar::Double:
+          c_normal = magnitude >= DBL_MIN;
+          break;
+        default:
+          // x86_fp80 / fp128: any value representable in a double that did
+          // not underflow is far above their smallest normal value.
+          break;
+      }
+    }
+    bool gt = false, ge = false, lt = false, le = false, ne = false, eq = false;
+    switch (s->predicate()) {
+      case ar::Comparison::FOGT:
+      case ar::Comparison::FUGT:
+        (swapped ? lt : gt) = true;
+        break;
+      case ar::Comparison::FOGE:
+      case ar::Comparison::FUGE:
+        (swapped ? le : ge) = true;
+        break;
+      case ar::Comparison::FOLT:
+      case ar::Comparison::FULT:
+        (swapped ? gt : lt) = true;
+        break;
+      case ar::Comparison::FOLE:
+      case ar::Comparison::FULE:
+        (swapped ? ge : le) = true;
+        break;
+      case ar::Comparison::FONE:
+      case ar::Comparison::FUNE:
+        ne = true;
+        break;
+      case ar::Comparison::FOEQ:
+        eq = true;
+        break;
+      default:
+        return;
+    }
+    if ((gt && (c > 0 || c_zero)) || (ge && c > 0 && c_normal) ||
+        (lt && (c < 0 || c_zero)) || (le && c < 0 && c_normal) ||
+        (ne && c_zero) || (eq && !c_zero && c_normal)) {
+      this->assume_float_non_zero(var, s->parent());
     }
   }
 
@@ -1940,9 +2126,188 @@ public:
 
     if (fun->is_intrinsic()) {
       this->exec_intrinsic_call(call, fun->intrinsic_id());
+    } else if (is_fabs_function(fun)) {
+      this->exec_fabs(call);
     } else {
       this->exec_unknown_extern_call(call);
     }
+  }
+
+  /// \brief Return true for fabs, fabsf, fabsl and llvm.fabs.* (v3.5.11.1)
+  static bool is_fabs_function(const ar::Function* fun) {
+    const std::string& name = fun->name();
+    return name == "fabs" || name == "fabsf" || name == "fabsl" ||
+           name.rfind("llvm.fabs.", 0) == 0;
+  }
+
+  /// \brief Return the called function, if the call is direct
+  static ar::Function* direct_callee(ar::CallBase* call) {
+    if (auto cst = dyn_cast< ar::FunctionPointerConstant >(call->called())) {
+      return cst->function();
+    }
+    return nullptr;
+  }
+
+  /// \brief Execute fabs(x): |x| has the zero classification of x
+  ///
+  /// fabs only clears the sign bit, so zero, subnormal and other values keep
+  /// their class. It has no other side effect.
+  void exec_fabs(ar::CallBase* call) {
+    if (!call->has_result() || call->num_arguments() != 1) {
+      this->exec_unknown_extern_call(call);
+      return;
+    }
+    const ScalarLit& arg = this->_lit_factory.get_scalar(call->argument(0));
+    const ScalarLit& result = this->_lit_factory.get_scalar(call->result());
+    if (!result.is_floating_point_var()) {
+      this->exec_unknown_extern_call(call);
+      return;
+    }
+    if (arg.is_floating_point_var()) {
+      this->_inv.normal().uninit_assert_initialized(arg.var());
+    }
+    core::FloatZero value = this->float_zero_of(arg);
+    this->_inv.normal().float_assign_nondet(result.var());
+    if (!value.is_top() && !value.is_bottom()) {
+      this->_inv.normal().float_set_zero(result.var(), value);
+    }
+  }
+
+  /// \brief Find the statement defining an internal variable (SSA)
+  static ar::Statement* float_definition(ar::InternalVariable* iv) {
+    thread_local std::unordered_map<
+        const ar::Code*,
+        std::unordered_map< const ar::InternalVariable*, ar::Statement* > >
+        cache;
+    ar::Code* code = iv->code();
+    if (code == nullptr) {
+      return nullptr;
+    }
+    auto it = cache.find(code);
+    if (it == cache.end()) {
+      auto& defs = cache[code];
+      for (ar::BasicBlock* bb : *code) {
+        for (ar::Statement* stmt : *bb) {
+          if (stmt->has_result()) {
+            if (auto res = dyn_cast< ar::InternalVariable >(stmt->result())) {
+              defs[res] = stmt;
+            }
+          }
+        }
+      }
+      it = cache.find(code);
+    }
+    auto def = it->second.find(iv);
+    return def == it->second.end() ? nullptr : def->second;
+  }
+
+  /// \brief Assume that the floating point value `v` is nonzero
+  ///
+  /// Also assume it for the source of an exact or zero-preserving conversion
+  /// and of fabs, since conv(y) != 0 and fabs(y) != 0 both imply y != 0.
+  void assume_float_non_zero(ar::Value* v,
+                             ar::BasicBlock* at,
+                             unsigned depth = 0) {
+    auto iv = dyn_cast< ar::InternalVariable >(v);
+    if (iv == nullptr || depth > 4) {
+      return;
+    }
+    uint64_t format = float_format(iv->type());
+    if (format == 0) {
+      return;
+    }
+    Variable* var = this->_var_factory.get_internal(iv);
+    core::FloatZero current = this->_inv.normal().float_to_zero(var);
+    if (!current.is_top() && current.format() != format) {
+      return; // Unknown encoding, do not refine
+    }
+    core::FloatZero non_zero = core::FloatZero::subnormal(format);
+    non_zero.join_with(core::FloatZero::other(format));
+    core::FloatZero refined = current;
+    refined.meet_with(non_zero);
+    if (refined.is_bottom()) {
+      this->_inv.set_normal_flow_to_bottom();
+      return;
+    }
+    this->_inv.normal().float_set_zero(var, refined);
+
+    ar::Statement* def = float_definition(iv);
+    if (auto un = dyn_cast_or_null< ar::UnaryOperation >(def)) {
+      if (un->op() == ar::UnaryOperation::FPExt ||
+          un->op() == ar::UnaryOperation::FPTrunc) {
+        this->assume_float_non_zero(un->operand(), at, depth + 1);
+      }
+    } else if (auto call = dyn_cast_or_null< ar::CallBase >(def)) {
+      ar::Function* fun = direct_callee(call);
+      if (fun != nullptr && is_fabs_function(fun) &&
+          call->num_arguments() == 1) {
+        this->assume_float_non_zero(call->argument(0), at, depth + 1);
+      }
+    } else if (auto load = dyn_cast_or_null< ar::Load >(def)) {
+      // The value was read from memory. If nothing may have written memory
+      // since the load, the cell still holds this exact value: store it back
+      // so that a later reload of the same address keeps `!= 0`.
+      if (!load->is_volatile() && load_still_valid(load, at)) {
+        const ScalarLit& ptr = this->_lit_factory.get_scalar(load->operand());
+        // v3.5.19: only write back into stack or global objects. A dynamic
+        // allocation site may stand for several objects (e.g. malloc in a
+        // loop); a strong write there would assert `!= 0` on all of them.
+        bool single_objects = false;
+        if (ptr.is_pointer_var()) {
+          auto addrs = this->_inv.normal().pointer_to_points_to(ptr.var());
+          single_objects = !addrs.is_top() && !addrs.is_bottom() &&
+                           !addrs.is_empty();
+          if (single_objects) {
+            for (MemoryLocation* addr : addrs) {
+              single_objects = single_objects &&
+                               (isa< LocalMemoryLocation >(addr) ||
+                                isa< GlobalMemoryLocation >(addr));
+            }
+          }
+        }
+        if (single_objects) {
+          auto size = MachineInt(
+              this->_data_layout.store_size_in_bytes(load->result()->type()),
+              this->_data_layout.pointers.bit_width,
+              Unsigned);
+          this->_inv.normal().mem_write(ptr.var(),
+                                        this->_lit_factory.get_scalar(iv),
+                                        size);
+        }
+      }
+    }
+  }
+
+  /// \brief Return true if memory cannot have changed between `load` and the
+  /// beginning of block `at`, which is `load`'s block or its only successor
+  /// reached through a single-predecessor edge.
+  static bool load_still_valid(ar::Load* load, ar::BasicBlock* at) {
+    ar::BasicBlock* bb = load->parent();
+    if (bb == nullptr || at == nullptr) {
+      return false;
+    }
+    if (at != bb && !(at->num_predecessors() == 1 &&
+                      *at->predecessor_begin() == bb)) {
+      return false;
+    }
+    bool after = false;
+    for (ar::Statement* stmt : *bb) {
+      if (stmt == load) {
+        after = true;
+        continue;
+      }
+      if (after && (isa< ar::Store >(stmt) || isa< ar::CallBase >(stmt))) {
+        // A call may write any memory; only pure fabs is accepted.
+        if (auto call = dyn_cast< ar::CallBase >(stmt)) {
+          ar::Function* fun = direct_callee(call);
+          if (fun != nullptr && is_fabs_function(fun)) {
+            continue;
+          }
+        }
+        return false;
+      }
+    }
+    return after;
   }
 
   /// \brief Execute a call to the given intrinsic function
@@ -2335,8 +2700,42 @@ public:
     }
   }
 
+private:
+  // Keep this bounded even for deeply nested aggregate types. Pointers are
+  // deliberately not followed: this query concerns the global object itself.
+  static bool contains_float(ar::Type* type, unsigned depth = 0) {
+    if (depth >= 32 || type->is_float()) {
+      return true;
+    }
+    if (auto sequential = dyn_cast< ar::SequentialType >(type)) {
+      return contains_float(sequential->element_type(), depth + 1);
+    }
+    if (auto structure = dyn_cast< ar::StructType >(type)) {
+      for (const auto& field : structure->layout()) {
+        if (contains_float(field.type, depth + 1)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+public:
   /// \brief Execute a call to an unknown extern function
   void exec_unknown_extern_call(ar::CallBase* call) override {
+    // Unknown external code may update a floating global without receiving its
+    // address as an argument. Do not let the new FP facts certify a subsequent
+    // division using stale contents. Other global types retain the existing
+    // external-call policy; pointer argument invalidation remains below.
+    for (auto it = this->_ctx.bundle->global_begin(),
+              end = this->_ctx.bundle->global_end();
+         it != end;
+         ++it) {
+      ar::GlobalVariable* global = *it;
+      if (contains_float(global->type()->pointee())) {
+        this->_inv.normal().mem_forget(this->_mem_factory.get_global(global));
+      }
+    }
     this->exec_unknown_call(call,
                             /* may_write_params = */ true,
                             /* ignore_unknown_write = */ true,

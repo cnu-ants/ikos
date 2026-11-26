@@ -45,10 +45,16 @@
 
 #include <ostream>
 
+#include <ikos/core/value/float_zero.hpp>
+
 namespace ikos {
 namespace core {
 
-struct DummyNumber {};
+// The numerical value remains abstract; retain just enough information for
+// zero-divisor checks through assignments, memory and function calls.
+struct DummyNumber {
+  FloatZero zero = FloatZero::top();
+};
 
 inline std::ostream& operator<<(std::ostream& o, const DummyNumber&) {
   o << "dummy";

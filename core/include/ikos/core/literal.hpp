@@ -89,7 +89,9 @@ private:
     // TODO(marthaud): Add a class to represent floating points
     DummyNumber value;
 
-    bool operator==(const FloatingPointLit&) const { return true; }
+    bool operator==(const FloatingPointLit& other) const {
+      return this->value.zero.equals(other.value.zero);
+    }
   };
 
   struct MemoryLocationLit {
@@ -176,8 +178,8 @@ public:
   }
 
   /// \brief Create a constant floating point literal
-  static Literal floating_point(DummyNumber) {
-    return Literal(Lit(FloatingPointLit{DummyNumber{}}));
+  static Literal floating_point(DummyNumber value) {
+    return Literal(Lit(FloatingPointLit{std::move(value)}));
   }
 
   /// \brief Create a constant memory location literal

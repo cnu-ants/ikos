@@ -389,6 +389,8 @@ private:
     virtual void float_assign(VariableRef x, VariableRef y) = 0;
 
     /// \brief Forget a floating point variable
+    virtual void float_set_zero(VariableRef x, const FloatZero& value) = 0;
+    virtual FloatZero float_to_zero(VariableRef x) const = 0;
     virtual void float_forget(VariableRef x) = 0;
 
     /// @}
@@ -1110,6 +1112,14 @@ private:
       this->_inv.float_assign(x, y);
     }
 
+    void float_set_zero(VariableRef x, const FloatZero& value) override {
+      this->_inv.float_set_zero(x, value);
+    }
+
+    FloatZero float_to_zero(VariableRef x) const override {
+      return this->_inv.float_to_zero(x);
+    }
+
     void float_forget(VariableRef x) override { this->_inv.float_forget(x); }
 
     /// @}
@@ -1768,6 +1778,14 @@ public:
 
   void float_assign(VariableRef x, VariableRef y) override {
     this->_ptr->float_assign(x, y);
+  }
+
+  void float_set_zero(VariableRef x, const FloatZero& value) override {
+    this->_ptr->float_set_zero(x, value);
+  }
+
+  FloatZero float_to_zero(VariableRef x) const override {
+    return this->_ptr->float_to_zero(x);
   }
 
   void float_forget(VariableRef x) override { this->_ptr->float_forget(x); }

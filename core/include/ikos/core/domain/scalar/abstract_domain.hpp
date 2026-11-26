@@ -52,6 +52,7 @@
 #include <ikos/core/semantic/memory_location.hpp>
 #include <ikos/core/semantic/scalar/variable.hpp>
 #include <ikos/core/semantic/variable.hpp>
+#include <ikos/core/value/float_zero.hpp>
 #include <ikos/core/value/machine_int/congruence.hpp>
 #include <ikos/core/value/machine_int/interval.hpp>
 #include <ikos/core/value/machine_int/interval_congruence.hpp>
@@ -298,6 +299,13 @@ public:
 
   /// \brief Assign `x = y`
   virtual void float_assign(VariableRef x, VariableRef y) = 0;
+
+  /// \brief Set FP classification without changing initializedness.
+  /// Also accepts a dynamic memory cell; the format belongs to its contents.
+  virtual void float_set_zero(VariableRef x, const FloatZero& value) = 0;
+
+  /// \brief Get the classification of a floating variable or dynamic cell.
+  virtual FloatZero float_to_zero(VariableRef x) const = 0;
 
   /// \brief Forget a floating point variable
   virtual void float_forget(VariableRef x) = 0;

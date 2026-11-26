@@ -894,7 +894,8 @@ class SARIFFormatter(Formatter):
 
     checks = [
         ('buffer_overflow_analysis', 'checks for buffer overflows and out-of-bound array accesses.'),
-        ('division_by_zero_analysis', 'checks for integer divisions by zero.'),
+        ('division_by_zero_analysis',
+         'checks for integer and floating point divisions by zero.'),
         ('null_pointer_analysis', 'checks for null pointer dereferences.'),
         ('assertion_prover', 'prove user-defined properties, using __ikos_assert(condition).'),
         ('unaligned_pointer_analysis', 'checks for unaligned pointer dereferences.'),
@@ -1359,14 +1360,21 @@ def generate_assert_message(report, verbosity):
 
 
 def generate_division_by_zero_message(report, verbosity):
+    info = report.load_info() or {}
+    floating = info.get('floating_point', False)
     if report.status == Result.OK:
-        return 'divisor is not zero'
+        return ('floating point divisor is not zero' if floating
+                else 'divisor is not zero')
     elif report.status == Result.ERROR:
-        return 'division by zero'
+        return ('floating point division by zero' if floating
+                else 'division by zero')
 
     assert report.status == Result.WARNING
+    if floating:
+        return 'floating point divisor might be zero'
+
     (_, operand), = report.load_operands()
-    interval = Interval.from_dict(report.load_info())
+    interval = Interval.from_dict(info)
 
     s = 'divisor might be zero'
     if verbosity >= 2 or not interval.is_top():

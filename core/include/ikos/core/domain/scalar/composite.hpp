@@ -66,8 +66,8 @@ namespace scalar {
 /// For each machine integer `x`, it keeps track of its value and whether it is
 /// initialized or not.
 ///
-/// For each floating point `x`, it keeps track of whether it is initialized or
-/// not.
+/// For each floating point `x`, it keeps track of initializedness and a
+/// format-tagged zero/subnormal/other classification.
 ///
 /// For each pointer `p`, it keep track of its address, its offset, its nullity
 /// and whether it is initialized or not.
@@ -124,6 +124,7 @@ public:
 
 private:
   using PointsToMap = SeparateDomain< VariableRef, PointsToSetT >;
+  using FloatZeroMap = SeparateDomain< VariableRef, FloatZero >;
   using IntVariableTrait = machine_int::VariableTraits< VariableRef >;
   using ScalarVariableTrait = scalar::VariableTraits< VariableRef >;
 
@@ -140,16 +141,20 @@ private:
   /// \brief Map pointer variables to set of addresses
   PointsToMap _points_to_map;
 
+  FloatZeroMap _float_zero;
+
 private:
   /// \brief Constructor
   CompositeDomain(UninitializedDomain uninitialized,
                   MachineIntDomain integer,
                   NullityDomain nullity,
-                  PointsToMap points_to_map)
+                  PointsToMap points_to_map,
+                  FloatZeroMap float_zero)
       : _uninitialized(std::move(uninitialized)),
         _integer(std::move(integer)),
         _nullity(std::move(nullity)),
-        _points_to_map(std::move(points_to_map)) {
+        _points_to_map(std::move(points_to_map)),
+        _float_zero(std::move(float_zero)) {
     this->normalize();
   }
 
@@ -165,7 +170,8 @@ public:
       : _uninitialized(std::move(uninitialized)),
         _integer(std::move(integer)),
         _nullity(std::move(nullity)),
-        _points_to_map(PointsToMap::top()) {
+        _points_to_map(PointsToMap::top()),
+        _float_zero(FloatZeroMap::top()) {
     this->normalize();
   }
 
@@ -212,6 +218,12 @@ public:
       return;
     }
 
+    this->_float_zero.normalize();
+    if (this->_float_zero.is_bottom()) {
+      this->set_to_bottom();
+      return;
+    }
+
     this->_points_to_map.normalize();
     if (this->_points_to_map.is_bottom()) {
       this->set_to_bottom();
@@ -234,12 +246,14 @@ private:
 public:
   bool is_bottom() const override {
     return this->_uninitialized.is_bottom() || this->_nullity.is_bottom() ||
-           this->_points_to_map.is_bottom() || this->_integer.is_bottom();
+           this->_points_to_map.is_bottom() || this->_integer.is_bottom() ||
+           this->_float_zero.is_bottom();
   }
 
   bool is_top() const override {
     return this->_uninitialized.is_top() && this->_nullity.is_top() &&
-           this->_points_to_map.is_top() && this->_integer.is_top();
+           this->_points_to_map.is_top() && this->_integer.is_top() &&
+           this->_float_zero.is_top();
   }
 
   void set_to_bottom() override {
@@ -247,6 +261,7 @@ public:
     this->_integer.set_to_bottom();
     this->_nullity.set_to_bottom();
     this->_points_to_map.set_to_bottom();
+    this->_float_zero.set_to_bottom();
   }
 
   void set_to_top() override {
@@ -254,6 +269,7 @@ public:
     this->_integer.set_to_top();
     this->_nullity.set_to_top();
     this->_points_to_map.set_to_top();
+    this->_float_zero.set_to_top();
   }
 
   bool leq(const CompositeDomain& other) const override {
@@ -265,7 +281,8 @@ public:
       return this->_uninitialized.leq(other._uninitialized) &&
              this->_integer.leq(other._integer) &&
              this->_nullity.leq(other._nullity) &&
-             this->_points_to_map.leq(other._points_to_map);
+             this->_points_to_map.leq(other._points_to_map) &&
+             this->_float_zero.leq(other._float_zero);
     }
   }
 
@@ -278,7 +295,8 @@ public:
       return this->_uninitialized.equals(other._uninitialized) &&
              this->_integer.equals(other._integer) &&
              this->_nullity.equals(other._nullity) &&
-             this->_points_to_map.equals(other._points_to_map);
+             this->_points_to_map.equals(other._points_to_map) &&
+             this->_float_zero.equals(other._float_zero);
     }
   }
 
@@ -294,6 +312,7 @@ public:
       this->_integer.join_with(std::move(other._integer));
       this->_nullity.join_with(std::move(other._nullity));
       this->_points_to_map.join_with(std::move(other._points_to_map));
+      this->_float_zero.join_with(std::move(other._float_zero));
     }
   }
 
@@ -308,6 +327,7 @@ public:
       this->_integer.join_with(other._integer);
       this->_nullity.join_with(other._nullity);
       this->_points_to_map.join_with(other._points_to_map);
+      this->_float_zero.join_with(other._float_zero);
     }
   }
 
@@ -323,6 +343,7 @@ public:
       this->_integer.join_loop_with(std::move(other._integer));
       this->_nullity.join_loop_with(std::move(other._nullity));
       this->_points_to_map.join_loop_with(std::move(other._points_to_map));
+      this->_float_zero.join_loop_with(std::move(other._float_zero));
     }
   }
 
@@ -337,6 +358,7 @@ public:
       this->_integer.join_loop_with(other._integer);
       this->_nullity.join_loop_with(other._nullity);
       this->_points_to_map.join_loop_with(other._points_to_map);
+      this->_float_zero.join_loop_with(other._float_zero);
     }
   }
 
@@ -352,6 +374,7 @@ public:
       this->_integer.join_iter_with(std::move(other._integer));
       this->_nullity.join_iter_with(std::move(other._nullity));
       this->_points_to_map.join_iter_with(std::move(other._points_to_map));
+      this->_float_zero.join_iter_with(std::move(other._float_zero));
     }
   }
 
@@ -366,6 +389,7 @@ public:
       this->_integer.join_iter_with(other._integer);
       this->_nullity.join_iter_with(other._nullity);
       this->_points_to_map.join_iter_with(other._points_to_map);
+      this->_float_zero.join_iter_with(other._float_zero);
     }
   }
 
@@ -380,6 +404,7 @@ public:
       this->_integer.widen_with(other._integer);
       this->_nullity.widen_with(other._nullity);
       this->_points_to_map.widen_with(other._points_to_map);
+      this->_float_zero.widen_with(other._float_zero);
     }
   }
 
@@ -395,6 +420,7 @@ public:
       this->_integer.widen_threshold_with(other._integer, threshold);
       this->_nullity.widen_with(other._nullity);
       this->_points_to_map.widen_with(other._points_to_map);
+      this->_float_zero.widen_with(other._float_zero);
     }
   }
 
@@ -409,6 +435,7 @@ public:
       this->_integer.meet_with(other._integer);
       this->_nullity.meet_with(other._nullity);
       this->_points_to_map.meet_with(other._points_to_map);
+      this->_float_zero.meet_with(other._float_zero);
     }
   }
 
@@ -423,6 +450,7 @@ public:
       this->_integer.narrow_with(other._integer);
       this->_nullity.narrow_with(other._nullity);
       this->_points_to_map.narrow_with(other._points_to_map);
+      this->_float_zero.narrow_with(other._float_zero);
     }
   }
 
@@ -438,6 +466,7 @@ public:
       this->_integer.narrow_threshold_with(other._integer, threshold);
       this->_nullity.narrow_with(other._nullity);
       this->_points_to_map.narrow_with(other._points_to_map);
+      this->_float_zero.narrow_with(other._float_zero);
     }
   }
 
@@ -450,7 +479,8 @@ public:
       return CompositeDomain(this->_uninitialized.join(other._uninitialized),
                              this->_integer.join(other._integer),
                              this->_nullity.join(other._nullity),
-                             this->_points_to_map.join(other._points_to_map));
+                             this->_points_to_map.join(other._points_to_map),
+                             this->_float_zero.join(other._float_zero));
     }
   }
 
@@ -465,7 +495,8 @@ public:
                              this->_integer.join_loop(other._integer),
                              this->_nullity.join_loop(other._nullity),
                              this->_points_to_map.join_loop(
-                                 other._points_to_map));
+                                 other._points_to_map),
+                             this->_float_zero.join_loop(other._float_zero));
     }
   }
 
@@ -480,7 +511,8 @@ public:
                              this->_integer.join_iter(other._integer),
                              this->_nullity.join_iter(other._nullity),
                              this->_points_to_map.join_iter(
-                                 other._points_to_map));
+                                 other._points_to_map),
+                             this->_float_zero.join_iter(other._float_zero));
     }
   }
 
@@ -495,7 +527,8 @@ public:
                              this->_integer.widening(other._integer),
                              this->_nullity.widening(other._nullity),
                              this->_points_to_map.widening(
-                                 other._points_to_map));
+                                 other._points_to_map),
+                             this->_float_zero.widening(other._float_zero));
     }
   }
 
@@ -513,7 +546,8 @@ public:
                                                                threshold),
                              this->_nullity.widening(other._nullity),
                              this->_points_to_map.widening(
-                                 other._points_to_map));
+                                 other._points_to_map),
+                             this->_float_zero.widening(other._float_zero));
     }
   }
 
@@ -526,7 +560,8 @@ public:
       return CompositeDomain(this->_uninitialized.meet(other._uninitialized),
                              this->_integer.meet(other._integer),
                              this->_nullity.meet(other._nullity),
-                             this->_points_to_map.meet(other._points_to_map));
+                             this->_points_to_map.meet(other._points_to_map),
+                             this->_float_zero.meet(other._float_zero));
     }
   }
 
@@ -541,7 +576,8 @@ public:
                              this->_integer.narrowing(other._integer),
                              this->_nullity.narrowing(other._nullity),
                              this->_points_to_map.narrowing(
-                                 other._points_to_map));
+                                 other._points_to_map),
+                             this->_float_zero.narrowing(other._float_zero));
     }
   }
 
@@ -559,7 +595,8 @@ public:
                                                                 threshold),
                              this->_nullity.narrowing(other._nullity),
                              this->_points_to_map.narrowing(
-                                 other._points_to_map));
+                                 other._points_to_map),
+                             this->_float_zero.narrowing(other._float_zero));
     }
   }
 
@@ -944,12 +981,14 @@ public:
   void float_assign_undef(VariableRef x) override {
     ikos_assert(ScalarVariableTrait::is_float(x));
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign_uninitialized(x);
   }
 
   void float_assign_nondet(VariableRef x) override {
     ikos_assert(ScalarVariableTrait::is_float(x));
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
   }
 
@@ -957,7 +996,21 @@ public:
     ikos_assert(ScalarVariableTrait::is_float(x));
     ikos_assert(ScalarVariableTrait::is_float(y));
 
+    this->_float_zero.set(x, this->_float_zero.get(y));
     this->_uninitialized.assign(x, y);
+  }
+
+  void float_set_zero(VariableRef x, const FloatZero& value) override {
+    ikos_assert(ScalarVariableTrait::is_float(x) ||
+                ScalarVariableTrait::is_dynamic(x));
+    if (!this->is_bottom_fast())
+      this->_float_zero.set(x, value);
+  }
+
+  FloatZero float_to_zero(VariableRef x) const override {
+    ikos_assert(ScalarVariableTrait::is_float(x) ||
+                ScalarVariableTrait::is_dynamic(x));
+    return this->is_bottom() ? FloatZero::bottom() : this->_float_zero.get(x);
   }
 
   void forget_copy_relations(VariableRef x) override {
@@ -973,6 +1026,7 @@ public:
   void float_forget(VariableRef x) override {
     ikos_assert(ScalarVariableTrait::is_float(x));
 
+    this->_float_zero.forget(x);
     this->_uninitialized.forget(x);
   }
 
@@ -1480,6 +1534,7 @@ public:
       return;
     }
 
+    this->_float_zero.set(x, this->_float_zero.get(y));
     this->_uninitialized.assign(x, y);
     if (IntVariableTrait::sign(x) == IntVariableTrait::sign(y)) {
       this->_integer.assign(x, y);
@@ -1499,6 +1554,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign_uninitialized(x);
     this->_integer.forget(x);
     this->_nullity.forget(x);
@@ -1513,6 +1569,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
     this->_nullity.forget(x);
@@ -1528,6 +1585,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     if (IntVariableTrait::sign(x) == n.sign()) {
       this->_integer.assign(x, n);
@@ -1546,6 +1604,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
     this->_nullity.forget(x);
@@ -1563,6 +1622,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign(x, y);
     if (IntVariableTrait::sign(x) == IntVariableTrait::sign(y)) {
       this->_integer.assign(x, y);
@@ -1581,6 +1641,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
     this->_nullity.forget(x);
@@ -1595,6 +1656,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
     this->_nullity.assign_null(x);
@@ -1614,6 +1676,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign_initialized(x);
     this->_integer.forget(x);
     this->_nullity.set(x, nullity);
@@ -1632,6 +1695,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign(x, y);
     this->_integer.forget(x);
     this->_nullity.assign(x, y);
@@ -1650,6 +1714,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign(x, y);
     if (IntVariableTrait::sign(x) == IntVariableTrait::sign(y)) {
       this->_integer.assign(x, y);
@@ -1666,6 +1731,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.assign(x, y);
     this->_nullity.assign(x, y);
     this->_points_to_map.set(x, this->_points_to_map.get(y));
@@ -1693,6 +1759,7 @@ public:
       return;
     }
 
+    this->_float_zero.forget(x);
     this->_uninitialized.forget(x);
     this->_integer.forget(x);
     this->_nullity.forget(x);
@@ -1850,6 +1917,8 @@ public:
       this->_nullity.dump(o);
       o << ", ";
       this->_points_to_map.dump(o);
+      o << ", fp_zero=";
+      this->_float_zero.dump(o);
       o << ")";
     }
   }
