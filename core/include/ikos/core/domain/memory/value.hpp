@@ -51,7 +51,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <type_traits>
+#include <vector>
 
 #include <ikos/core/domain/lifetime/abstract_domain.hpp>
 #include <ikos/core/domain/memory/abstract_domain.hpp>
@@ -1243,6 +1245,84 @@ private:
     return ikos::core::Uninitialized::top();
   }
 
+  /// \brief Join initializedness over the possible offsets of a range read.
+  ///
+  /// A missing cell means unknown, not initialized. Bound enumeration to keep
+  /// reads with large or unconstrained offsets inexpensive. Full byte coverage
+  /// also handles large initialized/uninitialized memory regions.
+  Uninitialized range_read_uninitialized(MemoryLocationRef base,
+                                         const IntIntervalCongruence& offset,
+                                         const MachineInt& size) {
+    if (offset.is_bottom()) {
+      return Uninitialized::bottom();
+    }
+    const auto& interval = offset.interval();
+    auto one = MachineInt(1, size.bit_width(), Unsigned);
+    bool overflow = false;
+    MachineInt last = add(interval.ub(), size - one, overflow);
+    if (overflow) {
+      return Uninitialized::top();
+    }
+    IntInterval span(interval.lb(), last);
+    // Prove full byte coverage first. This avoids enumerating large initialized
+    // arrays and does not require one wide cell to cover the whole region.
+    std::vector< VariableRef > cells;
+    for (VariableRef cell : this->_cells.get(base)) {
+      if (this->cell_overlap(cell, span)) {
+        cells.push_back(cell);
+      }
+    }
+    std::sort(cells.begin(), cells.end(), [](VariableRef a, VariableRef b) {
+      return CellVariableTrait::offset(a) < CellVariableTrait::offset(b);
+    });
+    ZNumber initialized_end = interval.lb().to_z_number();
+    ZNumber uninitialized_end = initialized_end;
+    ZNumber limit = last.to_z_number() + 1;
+    for (VariableRef cell : cells) {
+      Uninitialized state = this->_scalar.uninit_to_uninitialized(cell);
+      if (!state.is_initialized() && !state.is_uninitialized()) {
+        continue;
+      }
+      ZNumber begin = CellVariableTrait::offset(cell).to_z_number();
+      ZNumber end = begin + CellVariableTrait::size(cell).to_z_number();
+      ZNumber& covered =
+          state.is_initialized() ? initialized_end : uninitialized_end;
+      if (begin <= covered && covered < end) {
+        covered = end;
+        if (covered >= limit) {
+          return state;
+        }
+      }
+    }
+
+    // is_read_uninitialized builds byte masks. Avoid large masks, and do not
+    // enumerate a potentially unbounded number of byte offsets.
+    if (size.to_z_number() > 4096) {
+      return Uninitialized::top();
+    }
+    ZNumber lower = interval.lb().to_z_number();
+    ZNumber upper = interval.ub().to_z_number();
+    ZNumber step = offset.modulus();
+    if (step == 0) {
+      return this->is_read_uninitialized(base, interval.lb(), size);
+    }
+    if ((upper - lower) / step >= 128) {
+      return Uninitialized::top();
+    }
+    Uninitialized result = Uninitialized::bottom();
+    for (ZNumber current = lower; current <= upper; current += step) {
+      result.join_with(this->is_read_uninitialized(base,
+                                                   MachineInt(current,
+                                                              size.bit_width(),
+                                                              Unsigned),
+                                                   size));
+      if (result.is_top()) {
+        break;
+      }
+    }
+    return result;
+  }
+
   /// \brief Create a new cell for a read
   VariableRef read_realize_single_cell(MemoryLocationRef base,
                                        const MachineInt& offset,
@@ -1634,23 +1714,18 @@ public:
         }
       }
     } else {
-      // The offset is a range.
-      //
-      // If we try to read a summarized region of the heap we just
-      // return top. Note that we do not keep track of writes into
-      // summarized cells that's why if we read a summarized cell
-      // the only sound result we can return is top.
-      //
-      // TODO(jnavas): note that we could have a bounded array for which we
-      // have the complete set of cells and thus we could be more
-      // precise in that case.
-      //
-      // To deal with this situation in a more systematic way
-      // we should combine anyway the value domain with some
-      // summarization array-based domain (e.g.,some array domain
-      // such as a trivial array smashing or something more
-      // expressive like Cousot&Logozzo's POPL'11).
-      this->_scalar.scalar_assign_nondet(lhs.var());
+      // Numerical values of summarized cells remain unknown, but that does
+      // not imply initialization. Join the memory initializedness separately.
+      auto offset = this->_scalar.pointer_offset_to_interval_congruence(ptr);
+      Uninitialized state = Uninitialized::bottom();
+      for (MemoryLocationRef addr : addrs) {
+        state.join_with(this->range_read_uninitialized(addr, offset, size));
+        if (state.is_top()) {
+          break;
+        }
+      }
+      this->_scalar.scalar_forget(lhs.var());
+      this->_scalar.uninit_refine(lhs.var(), state);
     }
 
     //
