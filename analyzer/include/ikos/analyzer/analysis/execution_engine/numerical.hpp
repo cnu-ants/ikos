@@ -1637,7 +1637,12 @@ public:
       this->_inv.normal().pointer_assign(lhs.var(), base.var(), offset_expr);
     }
 
-    this->normalize_absolute_zero_nullity(lhs.var());
+    // Adding zero preserves the pointer, including a nullity constraint
+    // learned from a branch. Recomputing it from an unknown absolute
+    // address would lose that constraint when the offset includes zero.
+    if (!this->_inv.normal().int_to_interval(offset_expr).is_zero()) {
+      this->normalize_absolute_zero_nullity(lhs.var());
+    }
   }
 
   /// \brief Execute a Load statement
@@ -2388,15 +2393,18 @@ public:
       for (auto it = call->arg_begin(), et = call->arg_end(); it != et; ++it) {
         ar::Value* arg = *it;
 
-        if (!isa< ar::InternalVariable >(arg) ||
-            !isa< ar::PointerType >(arg->type())) {
+        if (!isa< ar::PointerType >(arg->type())) {
           continue;
         }
 
-        auto iv = cast< ar::InternalVariable >(arg);
-        Variable* ptr = this->_var_factory.get_internal(iv);
-
+        // An address-taken local or global can be passed directly, without
+        // an intermediate InternalVariable. Its contents can also change.
         this->init_global_operand(arg);
+        const ScalarLit& pointer = this->_lit_factory.get_scalar(arg);
+        if (!pointer.is_pointer_var()) {
+          continue;
+        }
+        Variable* ptr = pointer.var();
         this->refine_addresses(ptr);
 
         if (this->_inv.normal().nullity_is_null(ptr)) {
