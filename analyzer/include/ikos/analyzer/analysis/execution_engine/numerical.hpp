@@ -2775,6 +2775,43 @@ private:
                           Lifetime::allocated(),
                           MemoryInitialValue::Zero);
 
+    // Record the bytes that are initialized on every successful allocation.
+    // mem_zero_reachable() alone does not materialize initialized cells in
+    // the value memory domain. This is also needed when allocation sizes
+    // are not otherwise tracked (for example, with only the UVA checker).
+    auto lower_bound =
+        [this](const ScalarLit& value) -> boost::optional< MachineInt > {
+      if (value.is_machine_int()) {
+        return value.machine_int();
+      } else if (value.is_machine_int_var()) {
+        IntInterval interval = this->_inv.normal().int_to_interval(value.var());
+        if (!interval.is_bottom()) {
+          return interval.lb();
+        }
+      }
+      return boost::none;
+    };
+    auto count_lb = lower_bound(count);
+    auto size_lb = lower_bound(size);
+    if (count_lb && size_lb) {
+      bool overflow;
+      MachineInt initialized_size = mul(*count_lb, *size_lb, overflow);
+      if (!overflow && !initialized_size.is_zero() &&
+          (initialized_size.to_z_number() * 8).fits< uint64_t >()) {
+        // The allocation can still fail. Initializing the abstract object
+        // must not remove the null return path.
+        auto nullity = this->_inv.normal().nullity_to_nullity(lhs.var());
+        this->_inv.normal().nullity_set(lhs.var(), Nullity::non_null());
+        // A wider cell gets an unknown initialized integer value: only
+        // initializedness, rather than the numerical zero, is required here.
+        this->_inv.normal().mem_write(lhs.var(),
+                                      ScalarLit::machine_int(
+                                          MachineInt::zero(8, Unsigned)),
+                                      initialized_size);
+        this->_inv.normal().nullity_set(lhs.var(), nullity);
+      }
+    }
+
     if (!this->_opts.test(ExecutionEngine::UpdateAllocSizeVar)) {
       return;
     }
