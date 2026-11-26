@@ -47,6 +47,7 @@ void ikos::frontend::pass::initialize_ikos_passes(llvm::PassRegistry& PR) {
   llvm::initializeProveConstantFloatComparisonPassPass(PR);
   llvm::initializePromoteInitializedPassPass(PR);
   llvm::initializeSimplifySingleIterationLoopsPassPass(PR);
+  llvm::initializeFoldConstantGlobalBranchesPassPass(PR);
   llvm::initializeLowerCstExprPassPass(PR);
   llvm::initializeLowerSelectPassPass(PR);
   llvm::initializeMarkInternalInlinePassPass(PR);

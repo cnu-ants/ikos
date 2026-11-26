@@ -256,6 +256,12 @@ int main(int argc, char** argv) {
     // Ensure one single exit point per function (opt -mergereturn)
     pass_manager.add(llvm::createUnifyFunctionExitNodesPass());
   } else if (OptLevel == Basic) {
+    // Fold branches on globals never written in the whole program and on
+    // calls of functions that only return a constant (v3.5.17). The value
+    // analysis already proves the other edge unreachable; this also lets the
+    // syntactic proofs below see the real control flow.
+    pass_manager.add(ikos_pp::create_fold_constant_global_branches_pass());
+
     // SSA, preserving loads that may read uninitialized stack memory
     pass_manager.add(ikos_pp::create_promote_initialized_pass());
 

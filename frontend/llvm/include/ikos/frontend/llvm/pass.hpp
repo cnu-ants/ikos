@@ -59,6 +59,9 @@ llvm::FunctionPass* create_promote_initialized_pass();
 /// \brief Separate initial/final tests of proven single-iteration loops
 llvm::FunctionPass* create_simplify_single_iteration_loops_pass();
 
+/// \brief Fold branches on effectively constant globals (v3.5.17)
+llvm::ModulePass* create_fold_constant_global_branches_pass();
+
 /// \brief Lower constant expressions into instructions
 llvm::FunctionPass* create_lower_cst_expr_pass();
 
@@ -96,6 +99,9 @@ void initializePromoteInitializedPassPass(llvm::PassRegistry&);
 
 /// \brief Initialize the SimplifySingleIterationLoopsPass
 void initializeSimplifySingleIterationLoopsPassPass(llvm::PassRegistry&);
+
+/// \brief Initialize the FoldConstantGlobalBranchesPass
+void initializeFoldConstantGlobalBranchesPassPass(llvm::PassRegistry&);
 
 /// \brief Initialize the LowerCstExprPass
 void initializeLowerCstExprPassPass(llvm::PassRegistry&);
