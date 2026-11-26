@@ -786,6 +786,10 @@ void FunctionImporter::translate_cast(BasicBlockTranslation* bb_translation,
       ar::InternalVariable::create(this->_body, this->infer_type(cast));
   this->mark_variable_mapping(cast, var);
 
+  if (this->translate_narrow_signed_trunc(bb_translation, cast, var)) {
+    return;
+  }
+
   ar::Signedness sign = ar::Signed;
   ar::Type* src_type = nullptr;  // required type for the operand (or null)
   ar::Type* dest_type = nullptr; // type of the statement result (or null)
@@ -884,6 +888,147 @@ void FunctionImporter::translate_cast(BasicBlockTranslation* bb_translation,
   }
 }
 
+bool FunctionImporter::translate_narrow_signed_trunc(
+    BasicBlockTranslation* bb_translation,
+    llvm::CastInst* cast,
+    ar::InternalVariable* var) {
+  // v3.5.10.2: C computes `char r = a + b;` (a, b signed char/short) as
+  // `(char)((int)a + (int)b)`. Two's complement truncation of the wide sum
+  // is exactly the wrapping narrow sum, so translating it as a narrow signed
+  // operation (without no-wrap) keeps the same value. A result outside the
+  // narrow range is then reported as a signed overflow, as for `++c` since
+  // v3.5.10.1. Unsigned or unknown destinations are not affected.
+  if (cast->getOpcode() != llvm::Instruction::Trunc) {
+    return false;
+  }
+  auto type = llvm::dyn_cast< llvm::IntegerType >(cast->getDestTy());
+  if (!type || (type->getBitWidth() != 8 && type->getBitWidth() != 16)) {
+    return false;
+  }
+  unsigned width = type->getBitWidth();
+  auto operation = llvm::dyn_cast< llvm::BinaryOperator >(cast->getOperand(0));
+  if (!operation || operation->getParent() != cast->getParent() ||
+      (operation->getOpcode() != llvm::Instruction::Add &&
+       operation->getOpcode() != llvm::Instruction::Sub &&
+       operation->getOpcode() != llvm::Instruction::Mul)) {
+    return false;
+  }
+  // Operands: sign extensions from the same width, or constants that are
+  // representable in the signed narrow type.
+  auto narrow_source = [&](llvm::Value* value) -> bool {
+    if (auto sext = llvm::dyn_cast< llvm::SExtInst >(value)) {
+      return sext->getSrcTy() == type;
+    }
+    if (auto constant = llvm::dyn_cast< llvm::ConstantInt >(value)) {
+      return constant->getValue().isSignedIntN(width);
+    }
+    return false;
+  };
+  bool both_constant = llvm::isa< llvm::ConstantInt >(operation->getOperand(0)) &&
+                       llvm::isa< llvm::ConstantInt >(operation->getOperand(1));
+  if (!narrow_source(operation->getOperand(0)) ||
+      !narrow_source(operation->getOperand(1)) || both_constant) {
+    return false;
+  }
+
+  // Require explicit evidence that the destination is declared signed:
+  // the debug type of the result, or the declared type of a store target.
+  bool signed_dest = false;
+  bool unsigned_dest = false;
+  auto observe = [&](ar::Type* hint) {
+    if (auto integer = ar::dyn_cast< ar::IntegerType >(hint)) {
+      if (integer->bit_width() == width) {
+        signed_dest |= integer->is_signed();
+        unsigned_dest |= integer->is_unsigned();
+      }
+    }
+  };
+  llvm::SmallVector< llvm::DbgValueInst*, 2 > dbg_values;
+  llvm::findDbgValues(dbg_values, cast);
+  for (auto dbg : dbg_values) {
+    auto di_type = dbg->getVariable()->getType();
+    if (dbg->getExpression()->getNumElements() != 0 || di_type == nullptr) {
+      continue;
+    }
+    try {
+      observe(_ctx.type_imp->translate_type(cast->getType(), di_type));
+    } catch (const TypeDebugInfoMismatch&) {
+      if (!this->_allow_debug_info_mismatch) {
+        throw;
+      }
+    }
+  }
+  for (auto user : cast->users()) {
+    if (auto store = llvm::dyn_cast< llvm::StoreInst >(user)) {
+      if (store->getValueOperand() != cast) {
+        continue;
+      }
+      auto hint = this->infer_type_hint_operand(store->getPointerOperand());
+      if (!hint.ignore() && hint.score >= 1000) {
+        if (auto pointer = ar::dyn_cast< ar::PointerType >(hint.type)) {
+          observe(pointer->pointee());
+        }
+      }
+    }
+  }
+  if (!signed_dest || unsigned_dest) {
+    return false;
+  }
+
+  auto narrow_type = ar::IntegerType::get(this->_context, width, ar::Signed);
+  auto narrow = [&](llvm::Value* value) -> ar::Value* {
+    if (auto sext = llvm::dyn_cast< llvm::SExtInst >(value)) {
+      value = sext->getOperand(0);
+      // As in v3.5.10.1: re-read a just loaded operand with the signed type,
+      // if nothing can write memory in between, to keep a signed range.
+      if (auto load = llvm::dyn_cast< llvm::LoadInst >(value)) {
+        bool clean = load->isSimple() && load->getParent() == cast->getParent();
+        for (auto it = std::next(load->getIterator());
+             clean && &*it != cast;
+             ++it) {
+          clean = !it->mayWriteToMemory();
+        }
+        if (clean) {
+          auto ptr_type = ar::PointerType::get(this->_context, narrow_type);
+          ar::Value* pointer = this->translate_value(bb_translation,
+                                                     load->getPointerOperand(),
+                                                     ptr_type);
+          auto reloaded = ar::InternalVariable::create(this->_body, narrow_type);
+          reloaded->set_frontend< llvm::Value >(load);
+          auto stmt = ar::Load::create(reloaded,
+                                       pointer,
+                                       load->getAlign().value(),
+                                       /*is_volatile=*/false);
+          stmt->set_frontend< llvm::Value >(load);
+          bb_translation->add_statement(std::move(stmt));
+          return reloaded;
+        }
+      }
+      return this->translate_value(bb_translation, value, narrow_type);
+    }
+    return this->translate_cast_integer_value(bb_translation,
+                                              value,
+                                              narrow_type);
+  };
+  auto left = narrow(operation->getOperand(0));
+  auto right = narrow(operation->getOperand(1));
+  auto result = var->type() == narrow_type
+                    ? var
+                    : ar::InternalVariable::create(this->_body, narrow_type);
+  result->set_frontend< llvm::Value >(cast);
+  ar::BinaryOperation::Operator op =
+      operation->getOpcode() == llvm::Instruction::Add   ? ar::BinaryOperation::SAdd
+      : operation->getOpcode() == llvm::Instruction::Sub ? ar::BinaryOperation::SSub
+                                                         : ar::BinaryOperation::SMul;
+  auto stmt = ar::BinaryOperation::create(op, result, left, right);
+  stmt->set_frontend< llvm::Value >(cast);
+  bb_translation->add_statement(std::move(stmt));
+  if (result != var) {
+    this->add_bitcast(bb_translation, var, result);
+  }
+  return true;
+}
+
 void FunctionImporter::translate_getelementptr(
     BasicBlockTranslation* bb_translation, llvm::GetElementPtrInst* gep) {
   // Translate result variable
@@ -962,10 +1107,9 @@ static ar::Signedness sign_from_wraps(llvm::Instruction* inst) {
     // random guess.
     return ar::Signed;
   } else {
-    // In C, overflow on signed operations (add,sub) are undefined behaviors,
-    // and overflow on unsigned operations are implemetation defined.
-    // That means operations without nuw or nsw flags are necessary
-    // unsigned operations.
+    // Without flags LLVM arithmetic is modular and its source signedness is
+    // ambiguous (for example narrow signed updates also wrap). Prefer unsigned
+    // as a fallback; known narrow signed unit updates are handled separately.
     return ar::Unsigned;
   }
 }
@@ -1047,6 +1191,226 @@ static ar::BinaryOperation::Operator convert_float_bin_op(
   }
 }
 
+bool FunctionImporter::translate_narrow_signed_update(
+    BasicBlockTranslation* bb_translation,
+    llvm::BinaryOperator* inst,
+    ar::InternalVariable* var) {
+  auto type = llvm::dyn_cast< llvm::IntegerType >(inst->getType());
+  if (!type || (type->getBitWidth() != 8 && type->getBitWidth() != 16) ||
+      (inst->getOpcode() != llvm::Instruction::Add &&
+       inst->getOpcode() != llvm::Instruction::Sub) ||
+      inst->hasNoSignedWrap() || inst->hasNoUnsignedWrap()) {
+    return false;
+  }
+  auto is_unit = [](llvm::Value* value) {
+    auto constant = llvm::dyn_cast< llvm::ConstantInt >(value);
+    return constant && (constant->isOne() || constant->isMinusOne());
+  };
+  if (!is_unit(inst->getOperand(1)) &&
+      !(inst->getOpcode() == llvm::Instruction::Add &&
+        is_unit(inst->getOperand(0)))) {
+    return false;
+  }
+
+  // Missing nsw/nuw does not imply unsigned source arithmetic. Clang also
+  // emits narrow, wrapping updates for signed char/short ++/--. Require an
+  // explicit source type; usage heuristics alone cannot distinguish them
+  // from genuine unsigned updates.
+  bool signed_update = false;
+  bool unsigned_update = false;
+  bool signed_source = false;
+  bool unsigned_source = false;
+  auto observe_type = [&](ar::Type* hint, bool source) {
+    if (auto integer = ar::dyn_cast< ar::IntegerType >(hint)) {
+      if (integer->bit_width() == type->getBitWidth()) {
+        (source ? signed_source : signed_update) |= integer->is_signed();
+        (source ? unsigned_source : unsigned_update) |= integer->is_unsigned();
+      }
+    }
+  };
+  llvm::SmallVector< llvm::DbgValueInst*, 2 > dbg_values;
+  llvm::findDbgValues(dbg_values, inst);
+  for (auto dbg : dbg_values) {
+    if (dbg->getExpression()->getNumElements() != 0) {
+      continue;
+    }
+    auto di_type = dbg->getVariable()->getType();
+    if (di_type == nullptr) {
+      continue;
+    }
+    try {
+      auto hint = _ctx.type_imp->translate_type(inst->getType(), di_type);
+      observe_type(hint, false);
+      // Copies can give the result both signed and unsigned debug types.
+      // Prefer the variable whose previous value is the updated operand,
+      // rather than the type of a later copy of the result.
+      auto previous = inst->getIterator();
+      while (previous != inst->getParent()->begin()) {
+        auto old_dbg = llvm::dyn_cast< llvm::DbgValueInst >(&*--previous);
+        if (!old_dbg || old_dbg->getVariable() != dbg->getVariable()) {
+          continue;
+        }
+        if (old_dbg->getExpression()->getNumElements() == 0 &&
+            old_dbg->getValue() == inst->getOperand(0)) {
+          observe_type(hint, true);
+        }
+        break;
+      }
+    } catch (const TypeDebugInfoMismatch&) {
+      if (!this->_allow_debug_info_mismatch) {
+        throw;
+      }
+    }
+  }
+  // Follow declared pointers and aggregate indexing, but do not use
+  // signedness guessed from the arithmetic's own users as source evidence.
+  auto declared_pointer_type = [&](auto&& self,
+                                   llvm::Value* pointer,
+                                   unsigned depth) -> ar::PointerType* {
+    auto hint = this->infer_type_hint_operand(pointer);
+    if (!hint.ignore() && hint.score >= 1000) {
+      return ar::dyn_cast< ar::PointerType >(hint.type);
+    }
+    if (depth != 0) {
+      if (auto load = llvm::dyn_cast< llvm::LoadInst >(pointer)) {
+        if (auto parent = self(self, load->getPointerOperand(), depth - 1)) {
+          return ar::dyn_cast< ar::PointerType >(parent->pointee());
+        }
+      }
+      if (auto gep = llvm::dyn_cast< llvm::GetElementPtrInst >(pointer)) {
+        // GEP's LLVM result type has no integer signedness. Follow the
+        // declared aggregate type instead of the result's usage hints.
+        ar::Type* current = self(self, gep->getPointerOperand(), depth - 1);
+        if (current == nullptr) {
+          return nullptr;
+        }
+        for (auto it = llvm::gep_type_begin(gep), et = llvm::gep_type_end(gep);
+             it != et;
+             ++it) {
+          if (auto structure = it.getStructTypeOrNull()) {
+            auto aggregate = ar::dyn_cast< ar::StructType >(current);
+            auto index = llvm::dyn_cast< llvm::ConstantInt >(it.getOperand());
+            if (aggregate == nullptr || index == nullptr ||
+                aggregate->num_fields() != structure->getNumElements()) {
+              return nullptr;
+            }
+            auto field = index->getValue().getLimitedValue();
+            if (field >= aggregate->num_fields()) {
+              return nullptr;
+            }
+            const auto& member = aggregate->layout()[field];
+            auto offset =
+                this->_llvm_data_layout.getStructLayout(structure)
+                    ->getElementOffset(static_cast< unsigned >(field));
+            if (member.offset != ar::ZNumber(offset)) {
+              return nullptr;
+            }
+            current = member.type;
+          } else if (auto address = ar::dyn_cast< ar::PointerType >(current)) {
+            current = address->pointee();
+          } else if (auto sequence =
+                         ar::dyn_cast< ar::SequentialType >(current)) {
+            current = sequence->element_type();
+          } else {
+            return nullptr;
+          }
+        }
+        return ar::PointerType::get(this->_context, current);
+      }
+    }
+    return nullptr;
+  };
+  for (auto user : inst->users()) {
+    if (auto store = llvm::dyn_cast< llvm::StoreInst >(user)) {
+      auto pointer = store->getPointerOperand();
+      if (auto hint =
+              declared_pointer_type(declared_pointer_type, pointer, 8)) {
+        observe_type(hint->pointee(), false);
+        if (auto old = llvm::dyn_cast< llvm::LoadInst >(inst->getOperand(0))) {
+          if (old->getPointerOperand() == pointer) {
+            observe_type(hint->pointee(), true);
+          }
+        }
+      }
+    }
+  }
+  if (signed_source || unsigned_source) {
+    signed_update = signed_source;
+    unsigned_update = unsigned_source;
+  }
+  if (!signed_update || unsigned_update) {
+    return false;
+  }
+
+  // v3.5.10.1: translate the update as a signed operation of the narrow
+  // type itself. C computes `++c` as `(char)((int)c + 1)`; when the result
+  // leaves the range of the narrow type, the value silently changes (an
+  // implementation-defined conversion, e.g. 127 -> -128). This is reported
+  // as a signed integer overflow of the narrow type, as CWE-190 expects.
+  // A guarded update (e.g. `if (c < CHAR_MAX) ++c;`) stays in range and is
+  // not reported. Unsigned narrow types are not affected.
+  auto narrow_type =
+      ar::IntegerType::get(this->_context, type->getBitWidth(), ar::Signed);
+  {
+    auto narrow = [&](llvm::Value* value) -> ar::Value* {
+      if (llvm::isa< llvm::Constant >(value)) {
+        return this->translate_cast_integer_value(bb_translation,
+                                                  value,
+                                                  narrow_type);
+      }
+      // The operand of `++x` on memory is usually a load just before. That
+      // load may have been typed unsigned (no nsw/nuw on the update), and
+      // casting its unsigned interval back to signed loses a range learned
+      // on the signed value (e.g. `if (x < CHAR_MAX) ++x;`). If no write can
+      // happen in between, read the same address again with the signed type.
+      if (auto load = llvm::dyn_cast< llvm::LoadInst >(value)) {
+        bool clean = load->isSimple() && load->getParent() == inst->getParent();
+        for (auto it = std::next(load->getIterator());
+             clean && &*it != inst;
+             ++it) {
+          clean = !it->mayWriteToMemory();
+        }
+        if (clean) {
+          auto ptr_type = ar::PointerType::get(this->_context, narrow_type);
+          ar::Value* pointer = this->translate_value(bb_translation,
+                                                     load->getPointerOperand(),
+                                                     ptr_type);
+          auto reloaded = ar::InternalVariable::create(this->_body, narrow_type);
+          reloaded->set_frontend< llvm::Value >(load);
+          auto stmt = ar::Load::create(reloaded,
+                                       pointer,
+                                       load->getAlign().value(),
+                                       /*is_volatile=*/false);
+          stmt->set_frontend< llvm::Value >(load);
+          bb_translation->add_statement(std::move(stmt));
+          return reloaded;
+        }
+      }
+      return this->translate_value(bb_translation, value, narrow_type);
+    };
+    auto left = narrow(inst->getOperand(0));
+    auto right = narrow(inst->getOperand(1));
+    auto result = var->type() == narrow_type
+                      ? var
+                      : ar::InternalVariable::create(this->_body, narrow_type);
+    result->set_frontend< llvm::Value >(inst);
+    auto operation = ar::BinaryOperation::
+        create(inst->getOpcode() == llvm::Instruction::Add
+                   ? ar::BinaryOperation::SAdd
+                   : ar::BinaryOperation::SSub,
+               result,
+               left,
+               right);
+    operation->set_frontend< llvm::Value >(inst);
+    bb_translation->add_statement(std::move(operation));
+    if (result != var) {
+      this->add_bitcast(bb_translation, var, result);
+    }
+    return true;
+  }
+
+}
+
 void FunctionImporter::translate_binary_operator(
     BasicBlockTranslation* bb_translation, llvm::BinaryOperator* inst) {
   llvm::Type* llvm_type = inst->getType();
@@ -1055,6 +1419,10 @@ void FunctionImporter::translate_binary_operator(
   ar::InternalVariable* var =
       ar::InternalVariable::create(this->_body, this->infer_type(inst));
   this->mark_variable_mapping(inst, var);
+
+  if (this->translate_narrow_signed_update(bb_translation, inst, var)) {
+    return;
+  }
 
   if (llvm_type->isIntOrIntVectorTy()) {
     // Integer binary operation
