@@ -193,6 +193,7 @@ add_executable(ikos-analyzer
   src/analysis/call_context.cpp
   src/analysis/fixpoint_parameters.cpp
   src/analysis/hardware_addresses.cpp
+  src/analysis/initialization.cpp
   src/analysis/literal.cpp
   src/analysis/liveness.cpp
   src/analysis/memory_location.cpp

@@ -63,6 +63,7 @@
 
 #include <ikos/analyzer/analysis/context.hpp>
 #include <ikos/analyzer/analysis/execution_engine/engine.hpp>
+#include <ikos/analyzer/analysis/initialization.hpp>
 #include <ikos/analyzer/analysis/literal.hpp>
 #include <ikos/analyzer/analysis/liveness.hpp>
 #include <ikos/analyzer/analysis/option.hpp>
@@ -1884,6 +1885,21 @@ public:
       if (!s->is_volatile()) {
         // Perform memory read in the value domain
         this->_inv.normal().mem_read(lhs, ptr.var(), size);
+        // Recover definite initialization lost when distinct heap objects
+        // merge. Only strengthen the result after an all-path store proof.
+        // v3.5.19: only an unknown state is strengthened. A proof that
+        // contradicts a definite state (e.g. a wrong `pure` attribute) must
+        // not turn the state into bottom and drop the rest of the path.
+        if (!this->_inv.normal().uninit_is_initialized(lhs.var()) &&
+            !this->_inv.normal().uninit_is_uninitialized(lhs.var())) {
+          if (prove_initialized_load(s, this->_call_context)) {
+            this->_inv.normal().uninit_refine(lhs.var(),
+                                             Uninitialized::initialized());
+          } else if (prove_uninitialized_load(s, this->_call_context)) {
+            this->_inv.normal().uninit_refine(lhs.var(),
+                                             Uninitialized::uninitialized());
+          }
+        }
       } else {
         this->_inv.normal().scalar_assign_nondet(lhs.var());
       }
