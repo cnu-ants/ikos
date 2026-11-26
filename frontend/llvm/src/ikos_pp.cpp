@@ -449,6 +449,13 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Prove supported floating comparisons and expose necessary integer ranges
+  // for math guards. Keep calls and potentially erroneous arithmetic, so
+  // analysis diagnostics and side effects are not optimized away.
+  if (OptLevel != Custom) {
+    pass_manager.add(ikos_pp::create_prove_constant_float_comparison_pass());
+  }
+
   // Check that the module is well formed on completion of optimization
   if (!NoVerify) {
     pass_manager.add(llvm::createVerifierPass());

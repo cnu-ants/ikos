@@ -161,6 +161,7 @@ install(DIRECTORY include/
 
 # ikos-pp passes
 add_library(ikos-pp-lib
+  src/pass/prove_constant_float_comparison.cpp
   src/pass/initialize.cpp
   src/pass/lower_cst_expr.cpp
   src/pass/lower_select.cpp
@@ -173,6 +174,7 @@ if (IKOS_LINK_LLVM_DYLIB)
   set(IKOS_PP_LIB_LLVM_LIBS "LLVM")
 else()
   llvm_map_components_to_libnames(IKOS_PP_LIB_LLVM_LIBS
+    analysis
     core
     support
     transformutils
