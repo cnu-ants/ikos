@@ -49,7 +49,8 @@ namespace ikos {
 namespace frontend {
 namespace import {
 
-ar::Function* LibraryFunctionImporter::function(llvm::StringRef name) {
+ar::Function* LibraryFunctionImporter::function(llvm::StringRef name,
+                                                llvm::FunctionType* type) {
   // ikos functions
   if (this->_enable_ikos) {
     // <ikos/analyzer/intrinsic.h>
@@ -182,6 +183,24 @@ ar::Function* LibraryFunctionImporter::function(llvm::StringRef name) {
       return this->_bundle->intrinsic_function(ar::Intrinsic::LibcFclose);
     } else if (name == "fflush") {
       return this->_bundle->intrinsic_function(ar::Intrinsic::LibcFflush);
+    }
+    // <wchar.h>
+    if (name == "wcslen" && type->getNumParams() == 1) {
+      auto ptr = llvm::dyn_cast< llvm::PointerType >(type->getParamType(0));
+      if (ptr && !ptr->isOpaque()) {
+        auto element =
+            llvm::dyn_cast< llvm::IntegerType >(ptr->getPointerElementType());
+        if (element &&
+            (element->getBitWidth() == 16 || element->getBitWidth() == 32)) {
+          auto wchar_ty = ar::IntegerType::get(this->_context,
+                                               element->getBitWidth(),
+                                               ar::Signed);
+          return this->_bundle->intrinsic_function(ar::Intrinsic::LibcWcslen,
+                                                   wchar_ty);
+        }
+      }
+      // Keep the unknown-function model when the element width is unavailable.
+      return nullptr;
     }
     // <string.h>
     if (name == "strlen") {

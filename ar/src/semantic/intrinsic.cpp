@@ -383,6 +383,12 @@ FunctionType* Intrinsic::type(Bundle* bundle, ID id, Type* template_ty) {
       ret_ty = si32_ty;              // ret
       params.push_back(file_ptr_ty); // stream
     } break;
+    // <wchar.h>
+    case LibcWcslen: {
+      ikos_assert(template_ty != nullptr && template_ty->is_integer());
+      ret_ty = size_ty;
+      params.push_back(PointerType::get(ctx, template_ty)); // s
+    } break;
     // <string.h>
     case LibcStrlen: {
       ret_ty = size_ty;              // ret
@@ -729,6 +735,9 @@ std::string Intrinsic::short_name(ID id, Type* template_ty) {
       return "libc.fclose";
     case LibcFflush:
       return "libc.fflush";
+    // <wchar.h>
+    case LibcWcslen:
+      return "libc.wcslen." + template_type_name(template_ty);
     // <string.h>
     case LibcStrlen:
       return "libc.strlen";

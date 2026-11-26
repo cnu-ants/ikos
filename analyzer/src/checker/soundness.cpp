@@ -419,6 +419,7 @@ std::vector< SoundnessChecker::CheckResult > SoundnessChecker::
       return {};
     }
     // <string.h>
+    case ar::Intrinsic::LibcWcslen:
     case ar::Intrinsic::LibcStrlen:
     case ar::Intrinsic::LibcStrnlen: {
       return {};

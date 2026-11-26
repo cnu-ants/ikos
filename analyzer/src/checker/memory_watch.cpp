@@ -321,6 +321,7 @@ void MemoryWatchChecker::check_intrinsic_call(
     case ar::Intrinsic::LibcFflush: {
     } break;
     // <string.h>
+    case ar::Intrinsic::LibcWcslen:
     case ar::Intrinsic::LibcStrlen:
     case ar::Intrinsic::LibcStrnlen: {
     } break;

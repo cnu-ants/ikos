@@ -335,7 +335,8 @@ ar::Function* BundleImporter::translate_intrinsic_function(
 }
 
 ar::Function* BundleImporter::translate_library_function(llvm::Function* fun) {
-  ar::Function* ar_fun = _ctx.lib_fun_imp->function(fun->getName());
+  ar::Function* ar_fun =
+      _ctx.lib_fun_imp->function(fun->getName(), fun->getFunctionType());
 
   // Sanity check, can happen if the user uses C/C++ standard library names
   if (ar_fun != nullptr &&

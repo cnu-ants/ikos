@@ -585,6 +585,18 @@ std::vector< BufferOverflowChecker::CheckResult > BufferOverflowChecker::
                                       /* if_null = */ Result::Error,
                                       inv)};
     }
+    // <wchar.h>
+    case ar::Intrinsic::LibcWcslen: {
+      // As for strlen, check the first character and assume a well-formed
+      // string. A wide character occupies more than one byte.
+      auto element_ty =
+          cast< ar::PointerType >(call->argument(0)->type())->pointee();
+      return {this->check_mem_access(call,
+                                     call->argument(0),
+                                     this->store_size(element_ty),
+                                     /* if_null = */ Result::Error,
+                                     inv)};
+    }
     // <string.h>
     case ar::Intrinsic::LibcStrlen: {
       return {this->check_string_access(call,
