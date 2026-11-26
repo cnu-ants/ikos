@@ -163,6 +163,7 @@ install(DIRECTORY include/
 add_library(ikos-pp-lib
   src/pass/prove_constant_float_comparison.cpp
   src/pass/promote_initialized.cpp
+  src/pass/simplify_single_iteration_loops.cpp
   src/pass/initialize.cpp
   src/pass/lower_cst_expr.cpp
   src/pass/lower_select.cpp

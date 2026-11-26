@@ -56,6 +56,9 @@ llvm::FunctionPass* create_prove_constant_float_comparison_pass();
 /// \brief Promote stack slots without erasing uninitialized reads
 llvm::FunctionPass* create_promote_initialized_pass();
 
+/// \brief Separate initial/final tests of proven single-iteration loops
+llvm::FunctionPass* create_simplify_single_iteration_loops_pass();
+
 /// \brief Lower constant expressions into instructions
 llvm::FunctionPass* create_lower_cst_expr_pass();
 
@@ -90,6 +93,9 @@ void initializeProveConstantFloatComparisonPassPass(llvm::PassRegistry&);
 
 /// \brief Initialize the PromoteInitializedPass
 void initializePromoteInitializedPassPass(llvm::PassRegistry&);
+
+/// \brief Initialize the SimplifySingleIterationLoopsPass
+void initializeSimplifySingleIterationLoopsPassPass(llvm::PassRegistry&);
 
 /// \brief Initialize the LowerCstExprPass
 void initializeLowerCstExprPassPass(llvm::PassRegistry&);
