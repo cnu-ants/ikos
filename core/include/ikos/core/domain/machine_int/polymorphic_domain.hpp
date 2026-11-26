@@ -257,6 +257,8 @@ private:
     /// \brief Forget a variable
     virtual void forget(VariableRef x) = 0;
 
+    virtual void forget_copies(VariableRef x) = 0;
+
     /// \brief Projection to an interval
     virtual Interval to_interval(VariableRef x) const = 0;
 
@@ -580,6 +582,8 @@ private:
 
     void forget(VariableRef x) override { this->_inv.forget(x); }
 
+    void forget_copies(VariableRef x) override { this->_inv.forget_copies(x); }
+
     Interval to_interval(VariableRef x) const override {
       return this->_inv.to_interval(x);
     }
@@ -852,6 +856,8 @@ public:
   }
 
   void forget(VariableRef x) override { this->_ptr->forget(x); }
+
+  void forget_copies(VariableRef x) override { this->_ptr->forget_copies(x); }
 
   Interval to_interval(VariableRef x) const override {
     return this->_ptr->to_interval(x);

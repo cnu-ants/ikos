@@ -209,8 +209,8 @@ public:
     switch (pred) {
       case Predicate::EQ: {
         IntervalCongruence ic = xic.meet(yic);
-        this->_inv.set(x, ic);
-        this->_inv.set(y, ic);
+        this->_inv.refine(x, ic);
+        this->_inv.refine(y, ic);
       } break;
       case Predicate::NE: {
         if (x == y) {
@@ -218,10 +218,10 @@ public:
           return;
         }
         if (xic.singleton()) {
-          this->_inv.set(y, trim_bound(yic, *xic.singleton()));
+          this->_inv.refine(y, trim_bound(yic, *xic.singleton()));
         }
         if (yic.singleton()) {
-          this->_inv.set(x, trim_bound(xic, *yic.singleton()));
+          this->_inv.refine(x, trim_bound(xic, *yic.singleton()));
         }
       } break;
       case Predicate::GT: {
@@ -263,10 +263,10 @@ public:
     switch (pred) {
       case Predicate::EQ: {
         IntervalCongruence ic = xic.meet(yic);
-        this->_inv.set(x, ic);
+        this->_inv.refine(x, ic);
       } break;
       case Predicate::NE: {
-        this->_inv.set(x, trim_bound(xic, y));
+        this->_inv.refine(x, trim_bound(xic, y));
       } break;
       case Predicate::GT: {
         if (y.is_max()) {
@@ -324,6 +324,8 @@ public:
   }
 
   void forget(VariableRef x) override { this->_inv.forget(x); }
+
+  void forget_copies(VariableRef x) override { this->_inv.forget_copies(x); }
 
   Interval to_interval(VariableRef x) const override {
     return this->_inv.get(x).interval();

@@ -1575,6 +1575,24 @@ public:
         } else {
           this->_inv.normal().int_assign(alloc_size_var, alloc_size_int);
 
+          // v3.5.5.1: a memory cell keeps the signedness it is created with,
+          // and the undefined value below would create it signed. For an
+          // integer scalar, create the cell with its declared signedness
+          // first, so that unsigned reads stay copies of the cell and keep
+          // ranges learned by unsigned comparisons (e.g. `x < UINT_MAX`).
+          if (auto int_type = dyn_cast< ar::IntegerType >(s->allocated_type())) {
+            if (array_size.machine_int().to_z_number() == ZNumber(1) &&
+                alloc_size_int.to_z_number() * 8 ==
+                    ZNumber(int_type->bit_width())) {
+              this->_var_factory.get_cell(addr,
+                                          MachineInt::zero(alloc_size_int
+                                                               .bit_width(),
+                                                           Unsigned),
+                                          alloc_size_int,
+                                          int_type->sign());
+            }
+          }
+
           // When the size of the allocation is known (like it is here)
           // we mark the storage as uninitialized by assigning it
           // the undefined value.

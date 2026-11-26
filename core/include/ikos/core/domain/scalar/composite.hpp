@@ -960,6 +960,16 @@ public:
     this->_uninitialized.assign(x, y);
   }
 
+  void forget_copy_relations(VariableRef x) override {
+    if (ScalarVariableTrait::is_int(x)) {
+      this->_integer.forget_copies(x);
+    } else if (ScalarVariableTrait::is_pointer(x)) {
+      // NullityDomain::set() detaches x from its copy class.
+      this->_nullity.set(x, this->_nullity.get(x));
+      this->_integer.forget_copies(ScalarVariableTrait::offset_var(x));
+    }
+  }
+
   void float_forget(VariableRef x) override {
     ikos_assert(ScalarVariableTrait::is_float(x));
 
