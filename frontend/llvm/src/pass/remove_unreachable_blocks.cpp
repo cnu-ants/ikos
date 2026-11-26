@@ -41,6 +41,7 @@
  *
  ******************************************************************************/
 
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Local.h>
 
 #include <ikos/frontend/llvm/pass.hpp>
@@ -60,7 +61,11 @@ struct RemoveUnreachableBlocksPass final : public FunctionPass {
   }
 
   bool runOnFunction(Function& F) override {
-    return removeUnreachableBlocks(F);
+    // v3.5.19: llvm::removeUnreachableBlocks() also rewrites instructions
+    // that are undefined behaviour into `unreachable` (e.g. a store to a
+    // constant null pointer), which deletes the very errors IKOS checks.
+    // Only remove blocks that are unreachable in the control flow graph.
+    return EliminateUnreachableBlocks(F);
   }
 
 }; // end struct RemoveUnreachableBlocksPass

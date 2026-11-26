@@ -53,6 +53,9 @@ namespace pass {
 /// \brief Prove constant floating comparisons and strengthen math guards
 llvm::FunctionPass* create_prove_constant_float_comparison_pass();
 
+/// \brief Promote stack slots without erasing uninitialized reads
+llvm::FunctionPass* create_promote_initialized_pass();
+
 /// \brief Lower constant expressions into instructions
 llvm::FunctionPass* create_lower_cst_expr_pass();
 
@@ -84,6 +87,9 @@ namespace llvm {
 
 /// \brief Initialize the ProveConstantFloatComparisonPass
 void initializeProveConstantFloatComparisonPassPass(llvm::PassRegistry&);
+
+/// \brief Initialize the PromoteInitializedPass
+void initializePromoteInitializedPassPass(llvm::PassRegistry&);
 
 /// \brief Initialize the LowerCstExprPass
 void initializeLowerCstExprPassPass(llvm::PassRegistry&);
