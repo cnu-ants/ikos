@@ -1246,6 +1246,25 @@ private:
     VariableRef new_cell = this->make_cell(base, offset, size, sign);
     this->_scalar.uninit_refine(new_cell, addr_uninit);
     CellSetT cells = this->_cells.get(base);
+    // Any fully contained read of an initialized all-zero integer cell is
+    // also zero. This lets a preserved prefix/suffix serve smaller field reads
+    // without reconstructing arbitrary byte patterns or assuming endianness.
+    auto read_range = this->cell_range(new_cell);
+    for (VariableRef other : cells) {
+      if (this->_scalar.uninit_is_initialized(other) &&
+          this->_scalar.dynamic_is_zero(other) &&
+          read_range.leq(this->cell_range(other))) {
+        if (other != new_cell) {
+          this->_scalar
+              .dynamic_write_int(new_cell,
+                                 MachineInt::zero(MachIntVariableTrait::
+                                                      bit_width(new_cell),
+                                                  MachIntVariableTrait::sign(
+                                                      new_cell)));
+        }
+        break;
+      }
+    }
     cells.add(new_cell);
     this->_cells.set(base, cells);
     return new_cell;
@@ -1994,6 +2013,32 @@ private:
 
     for (VariableRef cell : cells) {
       if (this->cell_overlap(cell, range)) {
+        // A partial havoc must not destroy a known zero in the untouched
+        // prefix/suffix of a wide cell (for example a zeroed struct). Byte
+        // cells alone do not reconstruct an integer on a later wide read.
+        // Zero is independent of endianness; do not split arbitrary values.
+        if (this->_scalar.uninit_is_initialized(cell) &&
+            this->_scalar.dynamic_is_zero(cell)) {
+          auto old = this->cell_range(cell);
+          auto preserve_zero = [&](const MachineInt& offset,
+                                   const MachineInt& size) {
+            VariableRef piece = this->make_cell(addr, offset, size, Unsigned);
+            this->_scalar
+                .dynamic_write_int(piece,
+                                   MachineInt::
+                                       zero(MachIntVariableTrait::bit_width(
+                                                piece),
+                                            MachIntVariableTrait::sign(piece)));
+            new_cells.add(piece);
+          };
+          if (old.lb() < range.lb()) {
+            preserve_zero(old.lb(), range.lb() - old.lb());
+          }
+          if (range.ub() < old.ub()) {
+            auto one = MachineInt(1, range.ub().bit_width(), Unsigned);
+            preserve_zero(range.ub() + one, old.ub() - range.ub());
+          }
+        }
         this->_scalar.dynamic_forget(cell);
         new_cells.remove(cell);
       }
