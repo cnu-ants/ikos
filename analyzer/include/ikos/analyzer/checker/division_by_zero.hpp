@@ -81,6 +81,9 @@ private:
                              const value::AbstractDomain& inv);
 
 private:
+  /// \brief Prove an integer divisor nonzero from a dominating guard (v3.5.18)
+  bool guarded_nonzero(ar::BinaryOperation* stmt) const;
+
   /// \brief Dispay the check for the given division, if requested
   llvm::Optional< LogMessage > display_division_check(
       Result result, ar::BinaryOperation* stmt) const;
